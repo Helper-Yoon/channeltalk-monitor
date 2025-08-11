@@ -1,7 +1,9 @@
-# 아정당 채널톡 모니터링 시스템 - Dependencies
-aiohttp==3.9.1
-aioredis==2.0.1  # 구버전 코드와 호환되는 버전
-aiofiles==23.2.1
-python-dateutil==2.8.2
 
-# Python 버전: 3.10+
+# 아정당 채널톡 모니터링 - Redis 최적화 버전
+
+# Core (필수)
+aiohttp==3.9.1          # 비동기 웹 서버
+redis[hiredis]==5.0.1   # Redis 클라이언트 (C 가속 포함)
+
+# Python 3.10+ 필요
+# Render.com에서 자동으로 Python 버전 감지

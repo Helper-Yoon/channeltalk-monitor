@@ -54,19 +54,24 @@ class ChannelTalkMonitor:
             self.redis.close()
             await self.redis.wait_closed()
     
-    def calculate_wait_time(self, timestamp: str) -> int:
+    def calculate_wait_time(self, timestamp) -> int:
         """대기 시간 계산 (분 단위)"""
         try:
             if isinstance(timestamp, str):
                 # ISO format 처리
                 created_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-            else:
+            elif isinstance(timestamp, (int, float)):
+                # Unix timestamp (밀리초 처리)
+                if timestamp > 10000000000:  # 밀리초인 경우
+                    timestamp = timestamp / 1000
                 created_time = datetime.fromtimestamp(timestamp)
+            else:
+                created_time = timestamp
             
             wait_time = (datetime.utcnow() - created_time).total_seconds() / 60
             return max(0, int(wait_time))
         except Exception as e:
-            logger.error(f"시간 계산 오류: {e}")
+            logger.error(f"시간 계산 오류: {e}, timestamp: {timestamp}")
             return 0
     
     async def save_chat(self, chat_data: dict):
@@ -79,14 +84,14 @@ class ChannelTalkMonitor:
                 key = f"chat:{chat_id}"
                 await self.redis.setex(key, 3600, json.dumps(chat_data))
                 await self.redis.sadd('unanswered_chats', chat_id)
-                logger.info(f"💾 Redis 저장: {chat_id}")
+                logger.info(f"💾 Redis 저장: {chat_id} - {chat_data['customerName']}")
             except Exception as e:
                 logger.error(f"Redis 저장 실패: {e}")
                 self.memory_cache[chat_id] = chat_data
         else:
             # 메모리 캐시 저장
             self.memory_cache[chat_id] = chat_data
-            logger.info(f"💾 메모리 저장: {chat_id}")
+            logger.info(f"💾 메모리 저장: {chat_id} - {chat_data['customerName']}")
     
     async def remove_chat(self, chat_id: str):
         """채팅 제거"""
@@ -154,14 +159,26 @@ class ChannelTalkMonitor:
         
         try:
             data = await request.json()
-            event_type = data.get('type')
+            
+            # 웹훅 타입 확인 (다양한 가능성)
+            event_type = data.get('type') or data.get('event') or data.get('eventType')
             
             logger.info(f"📨 웹훅 수신: {event_type}")
-            logger.debug(f"웹훅 데이터: {json.dumps(data, ensure_ascii=False)[:500]}")
+            logger.info(f"📝 웹훅 데이터 키: {list(data.keys())}")
             
-            if event_type == 'message':
+            # 첫 번째 레벨 데이터 로깅
+            for key, value in data.items():
+                if isinstance(value, dict):
+                    logger.info(f"  - {key} 키들: {list(value.keys())}")
+            
+            # 다양한 이벤트 타입 처리
+            if event_type in ['message', 'message.create', 'chat.message']:
                 await self.process_message(data)
-            elif event_type == 'userChat':
+            elif event_type in ['userChat', 'user_chat', 'chat.state']:
+                await self.process_user_chat(data)
+            elif 'message' in data:  # type이 없지만 message 키가 있는 경우
+                await self.process_message(data)
+            elif 'userChat' in data or 'user_chat' in data:  # type이 없지만 userChat 키가 있는 경우
                 await self.process_user_chat(data)
             
             return web.json_response({"status": "ok"})
@@ -172,33 +189,87 @@ class ChannelTalkMonitor:
     async def process_message(self, data: dict):
         """메시지 이벤트 처리"""
         try:
-            message = data.get('message', {})
-            chat_id = message.get('chatId')
-            person_type = message.get('personType')
+            # 메시지 데이터 추출 (다양한 구조 처리)
+            message = data.get('message') or data.get('msg') or data.get('data', {}).get('message') or {}
+            
+            # chat_id 추출 (여러 가능성 시도)
+            chat_id = None
+            possible_ids = [
+                message.get('chatId'),
+                message.get('chat_id'),
+                message.get('userChatId'),
+                message.get('user_chat_id'),
+                data.get('chatId'),
+                data.get('chat_id'),
+                data.get('userChatId'),
+                data.get('user_chat_id'),
+                data.get('userChat', {}).get('id'),
+                data.get('user_chat', {}).get('id'),
+            ]
+            
+            for pid in possible_ids:
+                if pid:
+                    chat_id = pid
+                    break
             
             if not chat_id:
-                logger.warning("chat_id가 없는 메시지")
+                logger.warning(f"chat_id를 찾을 수 없음")
+                logger.info(f"메시지 데이터: {json.dumps(message, ensure_ascii=False)[:500]}")
                 return
             
-            logger.info(f"메시지 처리: chat_id={chat_id}, person_type={person_type}")
+            # person_type 추출
+            person_type = (
+                message.get('personType') or 
+                message.get('person_type') or 
+                message.get('type') or
+                message.get('senderType') or
+                message.get('sender_type')
+            )
+            
+            logger.info(f"📬 메시지 처리: chat_id={chat_id}, person_type={person_type}")
             
             # 고객 메시지인 경우
-            if person_type == 'user' and not message.get('isBot', False):
-                user_chat = data.get('userChat', {})
+            if person_type in ['user', 'customer', 'USER'] and not message.get('isBot', False):
+                # userChat 데이터 추출
+                user_chat = data.get('userChat') or data.get('user_chat') or data.get('chat') or {}
                 
                 # 고객 이름 추출 (여러 방법 시도)
                 customer_name = (
                     user_chat.get('name') or 
+                    user_chat.get('username') or
                     user_chat.get('profile', {}).get('name') or
                     message.get('personName') or
+                    message.get('person_name') or
+                    message.get('senderName') or
+                    message.get('sender_name') or
                     '익명'
                 )
                 
+                # 메시지 내용 추출
+                message_text = (
+                    message.get('plainText') or
+                    message.get('plain_text') or
+                    message.get('text') or
+                    message.get('message') or
+                    message.get('content') or
+                    ''
+                )
+                
+                # 타임스탬프 추출
+                timestamp = (
+                    message.get('createdAt') or
+                    message.get('created_at') or
+                    message.get('timestamp') or
+                    message.get('sentAt') or
+                    message.get('sent_at') or
+                    datetime.utcnow().isoformat()
+                )
+                
                 chat_data = {
-                    'id': chat_id,
+                    'id': str(chat_id),
                     'customerName': customer_name,
-                    'lastMessage': message.get('plainText', ''),
-                    'timestamp': message.get('createdAt', datetime.utcnow().isoformat()),
+                    'lastMessage': message_text,
+                    'timestamp': timestamp,
                     'waitMinutes': 0
                 }
                 
@@ -210,39 +281,40 @@ class ChannelTalkMonitor:
                     'chat': chat_data
                 })
                 
-                logger.info(f"✅ 새 상담 저장: {customer_name} - {chat_data['lastMessage'][:50]}")
+                logger.info(f"✅ 새 상담 저장: {customer_name} - {message_text[:50]}")
             
             # 매니저/봇 답변인 경우
-            elif person_type in ['manager', 'bot']:
-                await self.remove_chat(chat_id)
+            elif person_type in ['manager', 'bot', 'agent', 'MANAGER', 'BOT']:
+                await self.remove_chat(str(chat_id))
                 
                 # WebSocket 브로드캐스트
                 await self.broadcast({
                     'type': 'chat_answered',
-                    'chatId': chat_id
+                    'chatId': str(chat_id)
                 })
                 
                 logger.info(f"✅ 답변 완료: {chat_id}")
                 
         except Exception as e:
             logger.error(f"메시지 처리 오류: {e}", exc_info=True)
+            logger.error(f"문제 데이터: {json.dumps(data, ensure_ascii=False)[:1000]}")
     
     async def process_user_chat(self, data: dict):
         """유저챗 상태 변경 처리"""
         try:
-            user_chat = data.get('userChat', {})
-            chat_id = user_chat.get('id')
-            state = user_chat.get('state')
+            user_chat = data.get('userChat') or data.get('user_chat') or data.get('chat') or {}
+            chat_id = user_chat.get('id') or user_chat.get('chatId') or user_chat.get('chat_id')
+            state = user_chat.get('state') or user_chat.get('status')
             
-            logger.info(f"유저챗 처리: chat_id={chat_id}, state={state}")
+            logger.info(f"💬 유저챗 처리: chat_id={chat_id}, state={state}")
             
             # 상담 종료된 경우
-            if state == 'closed' and chat_id:
-                await self.remove_chat(chat_id)
+            if state in ['closed', 'resolved', 'completed'] and chat_id:
+                await self.remove_chat(str(chat_id))
                 
                 await self.broadcast({
                     'type': 'chat_answered',
-                    'chatId': chat_id
+                    'chatId': str(chat_id)
                 })
                 
                 logger.info(f"✅ 상담 종료: {chat_id}")
@@ -374,16 +446,41 @@ DEFAULT_DASHBOARD_HTML = """
             border-radius: 10px; 
             margin: 20px 0;
         }
+        .api-link {
+            display: inline-block;
+            margin: 10px 0;
+            padding: 10px 20px;
+            background: #2563EB;
+            color: white;
+            text-decoration: none;
+            border-radius: 5px;
+        }
     </style>
 </head>
 <body>
-    <h1>채널톡 미답변 상담 모니터</h1>
+    <h1>🔷 채널톡 미답변 상담 모니터</h1>
     <div class="status">
-        <p>서버가 실행 중입니다.</p>
-        <p>dashboard.html 파일을 업로드하여 완전한 대시보드를 사용하세요.</p>
-        <p><a href="/health" style="color: #2563EB;">헬스 체크</a></p>
-        <p><a href="/api/chats" style="color: #2563EB;">상담 목록 API</a></p>
+        <p>✅ 서버가 실행 중입니다.</p>
+        <p>📝 dashboard.html 파일을 업로드하여 완전한 대시보드를 사용하세요.</p>
+        <a href="/health" class="api-link">🏥 헬스 체크</a>
+        <a href="/api/chats" class="api-link">📋 상담 목록 보기</a>
     </div>
+    <script>
+        // 자동으로 API 체크
+        fetch('/api/chats')
+            .then(r => r.json())
+            .then(data => {
+                const div = document.createElement('div');
+                div.className = 'status';
+                div.innerHTML = `
+                    <h3>현재 미답변 상담: ${data.total}개</h3>
+                    ${data.chats.map(c => `
+                        <p>👤 ${c.customerName}: ${c.lastMessage || '(메시지 없음)'} - ${c.waitMinutes}분 대기</p>
+                    `).join('')}
+                `;
+                document.body.appendChild(div);
+            });
+    </script>
 </body>
 </html>
 """
@@ -428,6 +525,9 @@ async def create_app():
     # 백그라운드 태스크
     async def start_background_tasks(app):
         logger.info("🚀 서버 시작됨!")
+        logger.info("📌 대시보드: /")
+        logger.info("📌 API: /api/chats")
+        logger.info("📌 헬스체크: /health")
     
     async def cleanup_background_tasks(app):
         await monitor.cleanup()

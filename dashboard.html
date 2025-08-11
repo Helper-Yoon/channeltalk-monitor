@@ -1,0 +1,861 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>채널톡 미답변 상담 모니터 프로그램</title>
+    <style>
+        :root {
+            --bg-primary: #0a0a0a;
+            --bg-secondary: #1a1a1a;
+            --bg-card: #242424;
+            --bg-hover: #2a2a2a;
+            --text-primary: #ffffff;
+            --text-secondary: #a0a0a0;
+            --text-dim: #666666;
+            --channeltalk-blue: #2563EB;
+            --channeltalk-light: #3B82F6;
+            --status-critical: #DC2626;
+            --status-warning: #EA580C;
+            --status-caution: #FACC15;
+            --status-normal: #2563EB;
+            --status-new: #10B981;
+            --border-color: #333333;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        /* 배경 그라데이션 효과 */
+        body::before {
+            content: '';
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 400px;
+            background: radial-gradient(circle at 50% 0%, rgba(37, 99, 235, 0.1) 0%, transparent 70%);
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        .container {
+            max-width: 1600px;
+            margin: 0 auto;
+            padding: 20px;
+            position: relative;
+            z-index: 1;
+        }
+
+        /* 헤더 */
+        .header {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 30px;
+            margin-bottom: 24px;
+            box-shadow: 0 4px 24px rgba(0,0,0,0.3);
+            backdrop-filter: blur(10px);
+        }
+
+        .header-content {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 20px;
+        }
+
+        .logo-section {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .logo {
+            width: 50px;
+            height: 50px;
+            background: var(--channeltalk-blue);
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            font-size: 20px;
+            box-shadow: 0 0 20px rgba(37, 99, 235, 0.4);
+        }
+
+        .title {
+            font-size: 28px;
+            font-weight: 700;
+            color: var(--text-primary);
+        }
+
+        .live-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 12px;
+            background: rgba(37, 99, 235, 0.2);
+            border: 1px solid var(--channeltalk-blue);
+            border-radius: 20px;
+            font-size: 12px;
+            color: var(--channeltalk-light);
+            margin-left: 12px;
+        }
+
+        .live-dot {
+            width: 6px;
+            height: 6px;
+            background: var(--channeltalk-light);
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.6; transform: scale(1.5); }
+        }
+
+        /* 통계 카드 */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 16px;
+        }
+
+        .stat-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 16px;
+            text-align: center;
+            transition: all 0.3s;
+        }
+
+        .stat-card:hover {
+            transform: translateY(-2px);
+            border-color: var(--channeltalk-blue);
+            box-shadow: 0 4px 12px rgba(37, 99, 235, 0.2);
+        }
+
+        .stat-value {
+            font-size: 36px;
+            font-weight: 700;
+            margin-bottom: 4px;
+        }
+
+        .stat-label {
+            font-size: 11px;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 1.2px;
+        }
+
+        .stat-critical { color: var(--status-critical); }
+        .stat-warning { color: var(--status-warning); }
+        .stat-caution { color: var(--status-caution); }
+        .stat-normal { color: var(--channeltalk-blue); }
+        .stat-new { color: var(--status-new); }
+
+        /* 컨트롤 패널 */
+        .control-panel {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 16px;
+            margin-bottom: 24px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            align-items: center;
+        }
+
+        .btn {
+            padding: 10px 20px;
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+            background: var(--bg-card);
+            color: var(--text-primary);
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .btn:hover {
+            background: var(--bg-hover);
+            transform: translateY(-1px);
+        }
+
+        .btn-primary {
+            background: var(--channeltalk-blue);
+            border-color: var(--channeltalk-blue);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: var(--channeltalk-light);
+            box-shadow: 0 4px 12px rgba(37, 99, 235, 0.4);
+        }
+
+        .filter-indicator {
+            margin-left: auto;
+            padding: 6px 12px;
+            background: rgba(37, 99, 235, 0.1);
+            border: 1px solid var(--channeltalk-blue);
+            border-radius: 20px;
+            font-size: 12px;
+            color: var(--channeltalk-light);
+        }
+
+        /* 채팅 그리드 */
+        .chat-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+            gap: 20px;
+            margin-bottom: 40px;
+        }
+
+        .chat-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 20px;
+            position: relative;
+            overflow: hidden;
+            transition: all 0.3s;
+            animation: slideIn 0.4s ease-out;
+        }
+
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .chat-card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+        }
+
+        .chat-card::before {
+            content: '';
+            position: absolute;
+            left: 0;
+            top: 0;
+            bottom: 0;
+            width: 4px;
+        }
+
+        .chat-card.critical::before { background: var(--status-critical); }
+        .chat-card.warning::before { background: var(--status-warning); }
+        .chat-card.caution::before { background: var(--status-caution); }
+        .chat-card.normal::before { background: var(--status-normal); }
+        .chat-card.new::before { background: var(--status-new); }
+
+        .chat-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 16px;
+        }
+
+        .customer-info {
+            flex: 1;
+        }
+
+        .customer-name {
+            font-size: 18px;
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 4px;
+        }
+
+        .chat-id {
+            font-size: 11px;
+            color: var(--text-dim);
+            font-family: 'SF Mono', Monaco, monospace;
+        }
+
+        .wait-badge {
+            padding: 6px 12px;
+            border-radius: 8px;
+            font-size: 13px;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+
+        .badge-critical { 
+            background: rgba(220, 38, 38, 0.2); 
+            color: var(--status-critical);
+            border: 1px solid var(--status-critical);
+        }
+        .badge-warning { 
+            background: rgba(234, 88, 12, 0.2); 
+            color: var(--status-warning);
+            border: 1px solid var(--status-warning);
+        }
+        .badge-caution { 
+            background: rgba(250, 204, 21, 0.2); 
+            color: var(--status-caution);
+            border: 1px solid var(--status-caution);
+        }
+        .badge-normal { 
+            background: rgba(37, 99, 235, 0.2); 
+            color: var(--channeltalk-light);
+            border: 1px solid var(--channeltalk-blue);
+        }
+        .badge-new { 
+            background: rgba(16, 185, 129, 0.2); 
+            color: var(--status-new);
+            border: 1px solid var(--status-new);
+        }
+
+        .message-preview {
+            background: var(--bg-secondary);
+            border-radius: 8px;
+            padding: 12px;
+            margin-bottom: 16px;
+            color: var(--text-secondary);
+            font-size: 14px;
+            line-height: 1.5;
+            max-height: 60px;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .message-preview::after {
+            content: '';
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            height: 20px;
+            background: linear-gradient(transparent, var(--bg-secondary));
+        }
+
+        .chat-footer {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .chat-time {
+            font-size: 12px;
+            color: var(--text-dim);
+        }
+
+        .action-buttons {
+            display: flex;
+            gap: 8px;
+        }
+
+        .action-btn {
+            padding: 6px 12px;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            font-size: 12px;
+            color: var(--text-secondary);
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .action-btn:hover {
+            background: var(--channeltalk-blue);
+            border-color: var(--channeltalk-blue);
+            color: white;
+        }
+
+        /* 빈 상태 */
+        .empty-state {
+            grid-column: 1 / -1;
+            text-align: center;
+            padding: 80px 20px;
+        }
+
+        .empty-icon {
+            font-size: 80px;
+            margin-bottom: 20px;
+            opacity: 0.5;
+        }
+
+        .empty-title {
+            font-size: 24px;
+            margin-bottom: 8px;
+            color: var(--text-primary);
+        }
+
+        .empty-desc {
+            color: var(--text-secondary);
+        }
+
+        /* 알림 */
+        .notification {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background: var(--bg-card);
+            border: 1px solid var(--channeltalk-blue);
+            padding: 16px 20px;
+            border-radius: 12px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+            animation: slideInRight 0.4s ease-out;
+            z-index: 1000;
+            max-width: 300px;
+        }
+
+        @keyframes slideInRight {
+            from {
+                transform: translateX(100%);
+                opacity: 0;
+            }
+            to {
+                transform: translateX(0);
+                opacity: 1;
+            }
+        }
+
+        .notification-title {
+            font-weight: 600;
+            margin-bottom: 4px;
+            color: var(--channeltalk-light);
+        }
+
+        .notification-body {
+            font-size: 14px;
+            color: var(--text-secondary);
+        }
+
+        /* WebSocket 상태 표시 */
+        .connection-status {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            padding: 8px 16px;
+            background: var(--bg-card);
+            border-radius: 20px;
+            font-size: 12px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            z-index: 100;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+        }
+
+        .connected { background: var(--status-new); }
+        .disconnected { background: var(--status-critical); }
+        .connecting { background: var(--status-caution); animation: pulse 1s infinite; }
+
+        /* 스크롤바 커스텀 */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: var(--bg-secondary);
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--channeltalk-blue);
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--channeltalk-light);
+        }
+    </style>
+</head>
+<body>
+    <div class="connection-status" id="connectionStatus">
+        <span class="status-dot connecting"></span>
+        <span>연결 중...</span>
+    </div>
+
+    <div class="container">
+        <div class="header">
+            <div class="header-content">
+                <div class="logo-section">
+                    <div class="logo">아정</div>
+                    <h1 class="title">채널톡 미답변 상담 모니터 프로그램</h1>
+                    <span class="live-badge">
+                        <span class="live-dot"></span>
+                        LIVE
+                    </span>
+                </div>
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-value" id="totalCount">0</div>
+                        <div class="stat-label">전체</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value stat-critical" id="criticalCount">0</div>
+                        <div class="stat-label">11분↑</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value stat-warning" id="warningCount">0</div>
+                        <div class="stat-label">8-10분</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value stat-caution" id="cautionCount">0</div>
+                        <div class="stat-label">5-7분</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value stat-normal" id="normalCount">0</div>
+                        <div class="stat-label">2-4분</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value stat-new" id="newCount">0</div>
+                        <div class="stat-label">신규</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="control-panel">
+            <button class="btn btn-primary" onclick="refreshData()">
+                <span>🔄</span> 새로고침
+            </button>
+            <button class="btn" onclick="toggleAutoRefresh()">
+                <span id="autoRefreshIcon">⏸️</span> 자동새로고침
+            </button>
+            <button class="btn" onclick="filterCritical()">
+                <span>🚨</span> 긴급만
+            </button>
+            <button class="btn" onclick="filterAll()">
+                <span>📋</span> 전체보기
+            </button>
+            <button class="btn" onclick="exportData()">
+                <span>📊</span> 내보내기
+            </button>
+            <span class="filter-indicator" id="filterIndicator">전체 표시 중</span>
+        </div>
+
+        <div class="chat-grid" id="chatGrid">
+            <!-- 채팅 카드가 여기에 동적으로 생성됩니다 -->
+        </div>
+    </div>
+
+    <script>
+        // 전역 상태 관리
+        const state = {
+            chats: new Map(),
+            filter: 'all',
+            autoRefresh: true,
+            ws: null,
+            refreshInterval: null
+        };
+
+        // 서버 URL 설정
+        const SERVER_URL = window.location.origin;
+        const WS_URL = SERVER_URL.replace('http', 'ws') + '/ws';
+        const API_URL = SERVER_URL + '/api';
+
+        // 대기시간별 우선순위 결정
+        function getPriority(minutes) {
+            if (minutes >= 11) return 'critical';
+            if (minutes >= 8) return 'warning';
+            if (minutes >= 5) return 'caution';
+            if (minutes >= 2) return 'normal';
+            return 'new';
+        }
+
+        // 대기시간 포맷
+        function formatWaitTime(minutes) {
+            if (minutes < 1) return '방금';
+            if (minutes < 60) return `${Math.floor(minutes)}분`;
+            const hours = Math.floor(minutes / 60);
+            const mins = minutes % 60;
+            if (hours < 24) return `${hours}시간 ${Math.floor(mins)}분`;
+            const days = Math.floor(hours / 24);
+            return `${days}일 ${hours % 24}시간`;
+        }
+
+        // 채팅 카드 생성
+        function createChatCard(chat) {
+            const priority = getPriority(chat.waitMinutes);
+            const priorityClass = `badge-${priority}`;
+            
+            return `
+                <div class="chat-card ${priority}" data-id="${chat.id}">
+                    <div class="chat-header">
+                        <div class="customer-info">
+                            <div class="customer-name">${chat.customerName || '익명'}</div>
+                            <div class="chat-id">ID: ${chat.id.substring(0, 12)}...</div>
+                        </div>
+                        <div class="wait-badge ${priorityClass}">
+                            ⏱️ ${formatWaitTime(chat.waitMinutes)}
+                        </div>
+                    </div>
+                    <div class="message-preview">
+                        ${chat.lastMessage || '메시지 내용 없음'}
+                    </div>
+                    <div class="chat-footer">
+                        <span class="chat-time">
+                            ${new Date(chat.timestamp).toLocaleTimeString('ko-KR')}
+                        </span>
+                        <div class="action-buttons">
+                            <button class="action-btn" onclick="openChat('${chat.id}')">열기</button>
+                            <button class="action-btn" onclick="markAnswered('${chat.id}')">완료</button>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        // 렌더링
+        function render() {
+            const grid = document.getElementById('chatGrid');
+            const chatsArray = Array.from(state.chats.values());
+            
+            // 필터 적용
+            let filtered = chatsArray;
+            if (state.filter === 'critical') {
+                filtered = chatsArray.filter(c => c.waitMinutes >= 11);
+            }
+            
+            // 대기시간 순 정렬
+            filtered.sort((a, b) => b.waitMinutes - a.waitMinutes);
+            
+            if (filtered.length === 0) {
+                grid.innerHTML = `
+                    <div class="empty-state">
+                        <div class="empty-icon">✨</div>
+                        <div class="empty-title">모든 상담이 처리되었습니다</div>
+                        <div class="empty-desc">현재 대기 중인 미답변 상담이 없습니다</div>
+                    </div>
+                `;
+            } else {
+                grid.innerHTML = filtered.map(createChatCard).join('');
+            }
+            
+            updateStats();
+        }
+
+        // 통계 업데이트
+        function updateStats() {
+            const chats = Array.from(state.chats.values());
+            
+            document.getElementById('totalCount').textContent = chats.length;
+            document.getElementById('criticalCount').textContent = chats.filter(c => c.waitMinutes >= 11).length;
+            document.getElementById('warningCount').textContent = chats.filter(c => c.waitMinutes >= 8 && c.waitMinutes < 11).length;
+            document.getElementById('cautionCount').textContent = chats.filter(c => c.waitMinutes >= 5 && c.waitMinutes < 8).length;
+            document.getElementById('normalCount').textContent = chats.filter(c => c.waitMinutes >= 2 && c.waitMinutes < 5).length;
+            document.getElementById('newCount').textContent = chats.filter(c => c.waitMinutes < 2).length;
+        }
+
+        // 알림 표시
+        function showNotification(title, body, type = 'info') {
+            const notification = document.createElement('div');
+            notification.className = 'notification';
+            notification.innerHTML = `
+                <div class="notification-title">${title}</div>
+                <div class="notification-body">${body}</div>
+            `;
+            document.body.appendChild(notification);
+            
+            setTimeout(() => notification.remove(), 4000);
+            
+            // 브라우저 알림
+            if (Notification.permission === 'granted' && type === 'new') {
+                new Notification(title, { body, icon: '/favicon.ico' });
+            }
+        }
+
+        // WebSocket 연결
+        function connectWebSocket() {
+            updateConnectionStatus('connecting', '연결 중...');
+            
+            state.ws = new WebSocket(WS_URL);
+            
+            state.ws.onopen = () => {
+                updateConnectionStatus('connected', '실시간 연결됨');
+                console.log('WebSocket 연결됨');
+            };
+            
+            state.ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                handleWebSocketMessage(data);
+            };
+            
+            state.ws.onerror = (error) => {
+                console.error('WebSocket 오류:', error);
+                updateConnectionStatus('disconnected', '연결 끊김');
+            };
+            
+            state.ws.onclose = () => {
+                updateConnectionStatus('disconnected', '재연결 대기');
+                setTimeout(connectWebSocket, 5000);
+            };
+        }
+
+        // WebSocket 메시지 처리
+        function handleWebSocketMessage(data) {
+            switch(data.type) {
+                case 'new_chat':
+                    state.chats.set(data.chat.id, data.chat);
+                    showNotification('새 상담', `${data.chat.customerName}: ${data.chat.lastMessage}`, 'new');
+                    render();
+                    break;
+                case 'chat_answered':
+                    if (state.chats.has(data.chatId)) {
+                        state.chats.delete(data.chatId);
+                        render();
+                    }
+                    break;
+                case 'chat_update':
+                    if (state.chats.has(data.chat.id)) {
+                        state.chats.set(data.chat.id, data.chat);
+                        render();
+                    }
+                    break;
+                case 'bulk_update':
+                    state.chats.clear();
+                    data.chats.forEach(chat => state.chats.set(chat.id, chat));
+                    render();
+                    break;
+            }
+        }
+
+        // 연결 상태 업데이트
+        function updateConnectionStatus(status, text) {
+            const statusEl = document.getElementById('connectionStatus');
+            const dot = statusEl.querySelector('.status-dot');
+            const textEl = statusEl.querySelector('span:last-child');
+            
+            dot.className = `status-dot ${status}`;
+            textEl.textContent = text;
+        }
+
+        // API 호출
+        async function fetchData() {
+            try {
+                const response = await fetch(`${API_URL}/chats`);
+                const data = await response.json();
+                
+                state.chats.clear();
+                data.chats.forEach(chat => state.chats.set(chat.id, chat));
+                render();
+            } catch (error) {
+                console.error('데이터 로드 실패:', error);
+                showNotification('오류', '데이터를 불러올 수 없습니다');
+            }
+        }
+
+        // 컨트롤 함수들
+        function refreshData() {
+            fetchData();
+            showNotification('새로고침', '데이터를 새로고침했습니다');
+        }
+
+        function toggleAutoRefresh() {
+            state.autoRefresh = !state.autoRefresh;
+            const icon = document.getElementById('autoRefreshIcon');
+            
+            if (state.autoRefresh) {
+                icon.textContent = '⏸️';
+                state.refreshInterval = setInterval(fetchData, 5000);
+                showNotification('자동 새로고침', '5초마다 자동 새로고침됩니다');
+            } else {
+                icon.textContent = '▶️';
+                clearInterval(state.refreshInterval);
+                showNotification('자동 새로고침', '자동 새로고침이 중지되었습니다');
+            }
+        }
+
+        function filterCritical() {
+            state.filter = 'critical';
+            document.getElementById('filterIndicator').textContent = '긴급 상담만 표시 중';
+            render();
+        }
+
+        function filterAll() {
+            state.filter = 'all';
+            document.getElementById('filterIndicator').textContent = '전체 표시 중';
+            render();
+        }
+
+        function markAnswered(chatId) {
+            fetch(`${API_URL}/chats/${chatId}/answer`, { method: 'POST' })
+                .then(() => {
+                    state.chats.delete(chatId);
+                    render();
+                    showNotification('답변 완료', '상담이 답변 완료 처리되었습니다');
+                });
+        }
+
+        function openChat(chatId) {
+            // 채널톡 상담 페이지로 이동
+            window.open(`https://desk.channel.io/#/user-chats/${chatId}`, '_blank');
+        }
+
+        function exportData() {
+            const data = Array.from(state.chats.values());
+            const csv = [
+                ['ID', '고객명', '대기시간(분)', '마지막 메시지', '시간'],
+                ...data.map(c => [
+                    c.id,
+                    c.customerName,
+                    c.waitMinutes,
+                    c.lastMessage,
+                    new Date(c.timestamp).toLocaleString('ko-KR')
+                ])
+            ].map(row => row.join(',')).join('\n');
+            
+            const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement('a');
+            link.href = URL.createObjectURL(blob);
+            link.download = `channeltalk_${new Date().getTime()}.csv`;
+            link.click();
+        }
+
+        // 초기화
+        async function init() {
+            // 브라우저 알림 권한 요청
+            if (Notification.permission === 'default') {
+                await Notification.requestPermission();
+            }
+            
+            // 초기 데이터 로드
+            await fetchData();
+            
+            // WebSocket 연결
+            connectWebSocket();
+            
+            // 자동 새로고침 시작
+            if (state.autoRefresh) {
+                state.refreshInterval = setInterval(fetchData, 5000);
+            }
+        }
+
+        // 시작
+        init();
+    </script>
+</body>
+</html>

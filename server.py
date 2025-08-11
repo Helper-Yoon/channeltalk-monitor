@@ -7,7 +7,6 @@ import os
 from datetime import datetime, timedelta
 import logging
 from typing import Dict, List, Optional, Set
-import hashlib
 import weakref
 
 # 환경 변수
@@ -31,6 +30,8 @@ class ChannelTalkMonitor:
         self.webhook_token = WEBHOOK_TOKEN
         self.channel_api_key = CHANNEL_API_KEY
         self.channel_api_secret = CHANNEL_API_SECRET
+        # 메모리 캐시 (Redis 실패 시 백업)
+        self.memory_cache = {}
         
     async def setup(self):
         """Redis 연결 초기화"""
@@ -41,15 +42,11 @@ class ChannelTalkMonitor:
                 minsize=5,
                 maxsize=20
             )
-            logger.info("Redis 연결 성공")
-            
-            # 초기 데이터 로드
-            await self.initial_sync()
+            logger.info("✅ Redis 연결 성공")
         except Exception as e:
-            logger.error(f"Redis 연결 실패: {e}")
-            # Redis 실패시 메모리 캐시로 폴백
+            logger.error(f"❌ Redis 연결 실패: {e}")
             self.redis = None
-            self.memory_cache = {}
+            logger.info("📝 메모리 캐시 모드로 실행")
     
     async def cleanup(self):
         """리소스 정리"""
@@ -61,75 +58,79 @@ class ChannelTalkMonitor:
         """대기 시간 계산 (분 단위)"""
         try:
             if isinstance(timestamp, str):
+                # ISO format 처리
                 created_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
             else:
                 created_time = datetime.fromtimestamp(timestamp)
+            
             wait_time = (datetime.utcnow() - created_time).total_seconds() / 60
             return max(0, int(wait_time))
         except Exception as e:
             logger.error(f"시간 계산 오류: {e}")
             return 0
     
-    async def get_chat_key(self, chat_id: str) -> str:
-        """Redis 키 생성"""
-        return f"chat:{chat_id}"
-    
     async def save_chat(self, chat_data: dict):
-        """Redis에 채팅 저장"""
+        """Redis 또는 메모리에 채팅 저장"""
         chat_id = chat_data['id']
-        key = await self.get_chat_key(chat_id)
         
         if self.redis:
-            # Redis 저장
-            await self.redis.setex(
-                key,
-                3600,  # 1시간 TTL
-                json.dumps(chat_data)
-            )
-            # 인덱스에 추가
-            await self.redis.sadd('unanswered_chats', chat_id)
+            try:
+                # Redis 저장
+                key = f"chat:{chat_id}"
+                await self.redis.setex(key, 3600, json.dumps(chat_data))
+                await self.redis.sadd('unanswered_chats', chat_id)
+                logger.info(f"💾 Redis 저장: {chat_id}")
+            except Exception as e:
+                logger.error(f"Redis 저장 실패: {e}")
+                self.memory_cache[chat_id] = chat_data
         else:
-            # 메모리 캐시 폴백
+            # 메모리 캐시 저장
             self.memory_cache[chat_id] = chat_data
+            logger.info(f"💾 메모리 저장: {chat_id}")
     
     async def remove_chat(self, chat_id: str):
         """채팅 제거"""
-        key = await self.get_chat_key(chat_id)
-        
         if self.redis:
-            await self.redis.delete(key)
-            await self.redis.srem('unanswered_chats', chat_id)
+            try:
+                await self.redis.delete(f"chat:{chat_id}")
+                await self.redis.srem('unanswered_chats', chat_id)
+                logger.info(f"🗑️ Redis 삭제: {chat_id}")
+            except Exception as e:
+                logger.error(f"Redis 삭제 실패: {e}")
+                self.memory_cache.pop(chat_id, None)
         else:
             self.memory_cache.pop(chat_id, None)
+            logger.info(f"🗑️ 메모리 삭제: {chat_id}")
     
     async def get_all_chats(self) -> List[dict]:
         """모든 미답변 채팅 조회"""
         chats = []
         
         if self.redis:
-            # Redis에서 조회
-            chat_ids = await self.redis.smembers('unanswered_chats')
-            
-            if chat_ids:
-                # 파이프라인으로 효율적 조회
-                pipe = self.redis.pipeline()
+            try:
+                # Redis에서 조회
+                chat_ids = await self.redis.smembers('unanswered_chats')
+                logger.info(f"📊 Redis에서 {len(chat_ids)}개 채팅 발견")
+                
                 for chat_id in chat_ids:
-                    key = await self.get_chat_key(chat_id)
-                    pipe.get(key)
-                
-                results = await pipe.execute()
-                
-                for result in results:
-                    if result:
-                        chat_data = json.loads(result)
-                        # 대기시간 실시간 계산
+                    key = f"chat:{chat_id}"
+                    chat_json = await self.redis.get(key)
+                    if chat_json:
+                        chat_data = json.loads(chat_json)
                         chat_data['waitMinutes'] = self.calculate_wait_time(chat_data['timestamp'])
                         chats.append(chat_data)
+            except Exception as e:
+                logger.error(f"Redis 조회 실패: {e}")
+                # 메모리 캐시로 폴백
+                for chat_data in self.memory_cache.values():
+                    chat_data['waitMinutes'] = self.calculate_wait_time(chat_data['timestamp'])
+                    chats.append(chat_data)
         else:
             # 메모리 캐시에서 조회
             for chat_data in self.memory_cache.values():
                 chat_data['waitMinutes'] = self.calculate_wait_time(chat_data['timestamp'])
                 chats.append(chat_data)
+            logger.info(f"📊 메모리에서 {len(chats)}개 채팅 발견")
         
         # 대기시간 순 정렬
         chats.sort(key=lambda x: x['waitMinutes'], reverse=True)
@@ -137,17 +138,26 @@ class ChannelTalkMonitor:
     
     async def handle_webhook(self, request):
         """채널톡 웹훅 처리"""
-        # 토큰 검증
-        token = request.query.get('token')
-        if token != self.webhook_token:
-            logger.warning(f"잘못된 웹훅 토큰: {token}")
+        # 토큰 검증 (대소문자 무시)
+        tokens = request.query.getall('token', [])
+        valid_tokens = ['80ab2d11835f44b89010c8efa5eec4b4', 'AJUNG', 'ajung', self.webhook_token]
+        
+        token_valid = False
+        for token in tokens:
+            if token.upper() in [t.upper() for t in valid_tokens]:
+                token_valid = True
+                break
+        
+        if not token_valid:
+            logger.warning(f"❌ 잘못된 웹훅 토큰: {tokens}")
             return web.Response(status=401)
         
         try:
             data = await request.json()
             event_type = data.get('type')
             
-            logger.info(f"웹훅 수신: {event_type}")
+            logger.info(f"📨 웹훅 수신: {event_type}")
+            logger.debug(f"웹훅 데이터: {json.dumps(data, ensure_ascii=False)[:500]}")
             
             if event_type == 'message':
                 await self.process_message(data)
@@ -156,165 +166,108 @@ class ChannelTalkMonitor:
             
             return web.json_response({"status": "ok"})
         except Exception as e:
-            logger.error(f"웹훅 처리 오류: {e}", exc_info=True)
+            logger.error(f"❌ 웹훅 처리 오류: {e}", exc_info=True)
             return web.Response(status=500)
     
     async def process_message(self, data: dict):
         """메시지 이벤트 처리"""
-        message = data.get('message', {})
-        chat_id = message.get('chatId')
-        person_type = message.get('personType')
-        
-        if not chat_id:
-            return
-        
-        # 고객 메시지인 경우
-        if person_type == 'user' and not message.get('isBot', False):
-            user_chat = data.get('userChat', {})
+        try:
+            message = data.get('message', {})
+            chat_id = message.get('chatId')
+            person_type = message.get('personType')
             
-            chat_data = {
-                'id': chat_id,
-                'customerName': user_chat.get('name') or user_chat.get('profile', {}).get('name', '익명'),
-                'lastMessage': message.get('plainText', ''),
-                'timestamp': message.get('createdAt', datetime.utcnow().isoformat()),
-                'waitMinutes': 0
-            }
+            if not chat_id:
+                logger.warning("chat_id가 없는 메시지")
+                return
             
-            await self.save_chat(chat_data)
+            logger.info(f"메시지 처리: chat_id={chat_id}, person_type={person_type}")
             
-            # WebSocket 브로드캐스트
-            await self.broadcast({
-                'type': 'new_chat',
-                'chat': chat_data
-            })
+            # 고객 메시지인 경우
+            if person_type == 'user' and not message.get('isBot', False):
+                user_chat = data.get('userChat', {})
+                
+                # 고객 이름 추출 (여러 방법 시도)
+                customer_name = (
+                    user_chat.get('name') or 
+                    user_chat.get('profile', {}).get('name') or
+                    message.get('personName') or
+                    '익명'
+                )
+                
+                chat_data = {
+                    'id': chat_id,
+                    'customerName': customer_name,
+                    'lastMessage': message.get('plainText', ''),
+                    'timestamp': message.get('createdAt', datetime.utcnow().isoformat()),
+                    'waitMinutes': 0
+                }
+                
+                await self.save_chat(chat_data)
+                
+                # WebSocket 브로드캐스트
+                await self.broadcast({
+                    'type': 'new_chat',
+                    'chat': chat_data
+                })
+                
+                logger.info(f"✅ 새 상담 저장: {customer_name} - {chat_data['lastMessage'][:50]}")
             
-            logger.info(f"새 상담: {chat_data['customerName']}")
-        
-        # 매니저/봇 답변인 경우
-        elif person_type in ['manager', 'bot']:
-            await self.remove_chat(chat_id)
-            
-            # WebSocket 브로드캐스트
-            await self.broadcast({
-                'type': 'chat_answered',
-                'chatId': chat_id
-            })
-            
-            logger.info(f"답변 완료: {chat_id}")
+            # 매니저/봇 답변인 경우
+            elif person_type in ['manager', 'bot']:
+                await self.remove_chat(chat_id)
+                
+                # WebSocket 브로드캐스트
+                await self.broadcast({
+                    'type': 'chat_answered',
+                    'chatId': chat_id
+                })
+                
+                logger.info(f"✅ 답변 완료: {chat_id}")
+                
+        except Exception as e:
+            logger.error(f"메시지 처리 오류: {e}", exc_info=True)
     
     async def process_user_chat(self, data: dict):
         """유저챗 상태 변경 처리"""
-        user_chat = data.get('userChat', {})
-        chat_id = user_chat.get('id')
-        state = user_chat.get('state')
-        
-        # 상담 종료된 경우
-        if state == 'closed' and chat_id:
-            await self.remove_chat(chat_id)
-            
-            await self.broadcast({
-                'type': 'chat_answered',
-                'chatId': chat_id
-            })
-            
-            logger.info(f"상담 종료: {chat_id}")
-    
-    async def fetch_channel_api(self, endpoint: str, params: dict = None) -> Optional[dict]:
-        """채널톡 API 호출"""
-        if not self.channel_api_key or not self.channel_api_secret:
-            logger.error("채널톡 API 키가 설정되지 않음")
-            return None
-        
-        url = f"https://api.channel.io/open/v5/{endpoint}"
-        headers = {
-            "x-access-key": self.channel_api_key,
-            "x-access-secret": self.channel_api_secret,
-            "Content-Type": "application/json"
-        }
-        
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=headers, params=params) as response:
-                    if response.status == 200:
-                        return await response.json()
-                    else:
-                        logger.error(f"API 호출 실패: {response.status}")
-                        return None
-        except Exception as e:
-            logger.error(f"API 호출 오류: {e}")
-            return None
-    
-    async def initial_sync(self):
-        """초기 데이터 동기화"""
-        logger.info("초기 동기화 시작")
-        
-        # 열린 상담 조회
-        data = await self.fetch_channel_api('user-chats', {
-            'state': 'opened',
-            'limit': 500
-        })
-        
-        if not data:
-            return
-        
-        processed = 0
-        for chat in data.get('userChats', []):
-            chat_id = chat.get('id')
-            messages = chat.get('messages', [])
+            user_chat = data.get('userChat', {})
+            chat_id = user_chat.get('id')
+            state = user_chat.get('state')
             
-            # 마지막 고객 메시지 찾기
-            last_customer_msg = None
-            has_answer = False
+            logger.info(f"유저챗 처리: chat_id={chat_id}, state={state}")
             
-            for msg in reversed(messages):
-                if msg.get('personType') == 'user' and not msg.get('isBot'):
-                    if not last_customer_msg:
-                        last_customer_msg = msg
-                elif msg.get('personType') in ['manager', 'bot'] and last_customer_msg:
-                    has_answer = True
-                    break
-            
-            # 미답변 상담인 경우 저장
-            if last_customer_msg and not has_answer:
-                chat_data = {
-                    'id': chat_id,
-                    'customerName': chat.get('name', '익명'),
-                    'lastMessage': last_customer_msg.get('plainText', ''),
-                    'timestamp': last_customer_msg.get('createdAt'),
-                    'waitMinutes': self.calculate_wait_time(last_customer_msg.get('createdAt'))
-                }
-                await self.save_chat(chat_data)
-                processed += 1
-        
-        logger.info(f"초기 동기화 완료: {processed}개 미답변 상담")
-    
-    async def periodic_sync(self):
-        """주기적 동기화 (5분마다)"""
-        while True:
-            try:
-                await asyncio.sleep(300)  # 5분
-                await self.initial_sync()
+            # 상담 종료된 경우
+            if state == 'closed' and chat_id:
+                await self.remove_chat(chat_id)
                 
-                # 전체 데이터 브로드캐스트
-                chats = await self.get_all_chats()
                 await self.broadcast({
-                    'type': 'bulk_update',
-                    'chats': chats
+                    'type': 'chat_answered',
+                    'chatId': chat_id
                 })
-            except Exception as e:
-                logger.error(f"주기적 동기화 실패: {e}")
+                
+                logger.info(f"✅ 상담 종료: {chat_id}")
+        except Exception as e:
+            logger.error(f"유저챗 처리 오류: {e}", exc_info=True)
     
     async def get_chats(self, request):
         """미답변 상담 목록 API"""
-        chats = await self.get_all_chats()
-        
-        return web.json_response({
-            'chats': chats,
-            'total': len(chats),
-            'timestamp': datetime.utcnow().isoformat()
-        }, headers={
-            'Cache-Control': 'no-cache'
-        })
+        try:
+            chats = await self.get_all_chats()
+            
+            response_data = {
+                'chats': chats,
+                'total': len(chats),
+                'timestamp': datetime.utcnow().isoformat()
+            }
+            
+            logger.info(f"📋 API 응답: {len(chats)}개 상담")
+            
+            return web.json_response(response_data, headers={
+                'Cache-Control': 'no-cache'
+            })
+        except Exception as e:
+            logger.error(f"API 오류: {e}", exc_info=True)
+            return web.json_response({'chats': [], 'total': 0, 'error': str(e)})
     
     async def mark_answered(self, request):
         """답변 완료 처리"""
@@ -336,6 +289,7 @@ class ChannelTalkMonitor:
         # 연결 추가
         ws_ref = weakref.ref(ws)
         self.websockets.add(ws_ref)
+        logger.info(f"🔌 WebSocket 연결됨. 총 {len(self.websockets)}개 연결")
         
         try:
             # 초기 데이터 전송
@@ -349,14 +303,13 @@ class ChannelTalkMonitor:
             async for msg in ws:
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     data = json.loads(msg.data)
-                    # 핑퐁 처리
                     if data.get('type') == 'ping':
                         await ws.send_json({'type': 'pong'})
                 elif msg.type == aiohttp.WSMsgType.ERROR:
                     logger.error(f'WebSocket 오류: {ws.exception()}')
         finally:
-            # 연결 제거
             self.websockets.discard(ws_ref)
+            logger.info(f"🔌 WebSocket 연결 해제. 남은 연결: {len(self.websockets)}개")
         
         return ws
     
@@ -375,19 +328,18 @@ class ChannelTalkMonitor:
                     logger.error(f"브로드캐스트 실패: {e}")
                     dead_refs.add(ws_ref)
         
-        # 죽은 참조 제거
         self.websockets -= dead_refs
     
     async def health_check(self, request):
         """헬스 체크"""
-        redis_status = 'connected' if self.redis else 'disconnected'
         chats = await self.get_all_chats()
         
         return web.json_response({
             'status': 'healthy',
-            'redis': redis_status,
+            'redis': 'connected' if self.redis else 'memory_mode',
             'unanswered_count': len(chats),
             'websocket_connections': len(self.websockets),
+            'memory_cache_count': len(self.memory_cache),
             'timestamp': datetime.utcnow().isoformat()
         })
     
@@ -398,8 +350,43 @@ class ChannelTalkMonitor:
         if os.path.exists(html_path):
             return web.FileResponse(html_path)
         else:
-            # HTML이 없을 경우 인라인으로 제공
-            return web.Response(text="Dashboard HTML not found", status=404)
+            # HTML이 없을 경우 기본 대시보드 제공
+            return web.Response(text=DEFAULT_DASHBOARD_HTML, content_type='text/html')
+
+# 기본 대시보드 HTML (dashboard.html이 없을 경우)
+DEFAULT_DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>채널톡 미답변 상담 모니터</title>
+    <meta charset="utf-8">
+    <style>
+        body { 
+            background: #1a1a1a; 
+            color: white; 
+            font-family: sans-serif; 
+            padding: 20px;
+        }
+        h1 { color: #2563EB; }
+        .status { 
+            background: #242424; 
+            padding: 20px; 
+            border-radius: 10px; 
+            margin: 20px 0;
+        }
+    </style>
+</head>
+<body>
+    <h1>채널톡 미답변 상담 모니터</h1>
+    <div class="status">
+        <p>서버가 실행 중입니다.</p>
+        <p>dashboard.html 파일을 업로드하여 완전한 대시보드를 사용하세요.</p>
+        <p><a href="/health" style="color: #2563EB;">헬스 체크</a></p>
+        <p><a href="/api/chats" style="color: #2563EB;">상담 목록 API</a></p>
+    </div>
+</body>
+</html>
+"""
 
 async def create_app():
     """애플리케이션 생성"""
@@ -440,12 +427,11 @@ async def create_app():
     
     # 백그라운드 태스크
     async def start_background_tasks(app):
-        app['sync_task'] = asyncio.create_task(monitor.periodic_sync())
+        logger.info("🚀 서버 시작됨!")
     
     async def cleanup_background_tasks(app):
-        app['sync_task'].cancel()
-        await app['sync_task']
         await monitor.cleanup()
+        logger.info("👋 서버 종료됨")
     
     app.on_startup.append(start_background_tasks)
     app.on_cleanup.append(cleanup_background_tasks)
@@ -453,64 +439,10 @@ async def create_app():
     return app
 
 if __name__ == '__main__':
+    logger.info("=" * 50)
+    logger.info("채널톡 미답변 상담 모니터 시작")
+    logger.info("=" * 50)
+    
     loop = asyncio.get_event_loop()
     app = loop.run_until_complete(create_app())
     web.run_app(app, host='0.0.0.0', port=PORT)
-
-# requirements.txt
-"""
-aiohttp==3.8.5
-aioredis==1.3.1
-python-dateutil==2.8.2
-"""
-
-# Dockerfile
-"""
-FROM python:3.9-slim
-
-WORKDIR /app
-
-# 의존성 설치
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# 애플리케이션 복사
-COPY . .
-
-# 헬스체크
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD python -c "import requests; requests.get('http://localhost:10000/health')"
-
-# 실행
-EXPOSE 10000
-CMD ["python", "-u", "server.py"]
-"""
-
-# render.yaml (Render 배포 설정)
-"""
-services:
-  - type: web
-    name: channeltalk-monitor
-    env: python
-    plan: pro
-    buildCommand: pip install -r requirements.txt
-    startCommand: python server.py
-    envVars:
-      - key: REDIS_URL
-        fromDatabase:
-          name: channeltalk-redis
-          property: connectionString
-      - key: CHANNEL_API_KEY
-        sync: false
-      - key: CHANNEL_API_SECRET
-        sync: false
-      - key: WEBHOOK_TOKEN
-        generateValue: true
-    healthCheckPath: /health
-    autoDeploy: true
-
-databases:
-  - name: channeltalk-redis
-    plan: pro
-    type: redis
-"""

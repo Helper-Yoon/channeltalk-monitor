@@ -11,7 +11,7 @@ import weakref
 
 # ===== 환경 변수 =====
 REDIS_URL = os.getenv('REDIS_URL', 'redis://red-d2ct46buibrs738rintg:6379')
-WEBHOOK_TOKEN = os.getenv('WEBHOOK_TOKEN', '80ab2d11835f44b89010c8efa5eec4b4')
+WEBHOOK_TOKEN = '80ab2d11835f44b89010c8efa5eec4b4'  # 하드코딩 (환경변수 문제 해결)
 PORT = int(os.getenv('PORT', 10000))
 
 # ===== 로깅 설정 =====
@@ -125,6 +125,10 @@ class ChannelTalkMonitor:
     async def get_all_chats(self) -> List[dict]:
         """Redis에서 모든 채팅 조회"""
         try:
+            if not self.redis:
+                logger.warning("Redis 연결 없음")
+                return []
+                
             # Sorted Set으로 시간순 정렬된 ID 가져오기
             chat_ids = await self.redis.zrevrange('chats_by_time', 0, -1)
             
@@ -174,15 +178,15 @@ class ChannelTalkMonitor:
     
     async def handle_webhook(self, request):
         """채널톡 웹훅 수신"""
-        # 토큰 검증 수정 - 여러 개의 토큰 처리
+        # 토큰 검증 - 간단하게
         tokens = request.query.getall('token', [])
         
-        logger.info(f"🔔 웹훅 요청 - 토큰: {tokens}")
-        
-        # 토큰 배열 중 하나라도 일치하면 OK
-        if not tokens or WEBHOOK_TOKEN not in tokens:
+        # 토큰 확인 - 하나라도 일치하면 OK
+        if '80ab2d11835f44b89010c8efa5eec4b4' not in tokens:
             logger.warning(f"❌ 잘못된 토큰: {tokens}")
             return web.Response(status=401)
+        
+        logger.info(f"✅ 웹훅 토큰 확인 완료")
         
         try:
             data = await request.json()
@@ -720,6 +724,10 @@ async def create_app():
 # ===== 메인 실행 =====
 if __name__ == '__main__':
     logger.info("🏁 프로그램 시작")
-    loop = asyncio.get_event_loop()
-    app = loop.run_until_complete(create_app())
+    
+    async def main():
+        app = await create_app()
+        return app
+    
+    app = asyncio.run(main())
     web.run_app(app, host='0.0.0.0', port=PORT)

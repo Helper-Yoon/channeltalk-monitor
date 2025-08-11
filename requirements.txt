@@ -1,5 +1,7 @@
+# 아정당 채널톡 모니터링 시스템 - Dependencies
 aiohttp==3.9.1
-redis==5.0.1
-uvloop==0.19.0
+aioredis==2.0.1  # 구버전 코드와 호환되는 버전
 aiofiles==23.2.1
 python-dateutil==2.8.2
+
+# Python 버전: 3.10+

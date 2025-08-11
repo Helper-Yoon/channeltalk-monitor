@@ -424,6 +424,19 @@ class ChannelTalkMonitor:
             'lastSync': self.last_sync
         })
     
+    async def mark_answered(self, request):
+        """API: 수동 답변 완료 처리"""
+        try:
+            chat_id = request.match_info.get('chat_id')
+            if chat_id:
+                await self.remove_chat(chat_id)
+                return web.json_response({'status': 'ok', 'chatId': chat_id})
+            else:
+                return web.json_response({'status': 'error', 'message': 'No chat_id provided'}, status=400)
+        except Exception as e:
+            logger.error(f"답변 완료 처리 오류: {e}")
+            return web.json_response({'status': 'error', 'message': str(e)}, status=500)
+    
     async def handle_websocket(self, request):
         """WebSocket 처리 (개선)"""
         ws = web.WebSocketResponse(heartbeat=PING_INTERVAL)

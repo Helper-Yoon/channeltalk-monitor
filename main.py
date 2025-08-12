@@ -27,9 +27,9 @@ logging.basicConfig(
 logger = logging.getLogger('ChannelTalk')
 
 # ===== 상수 정의 =====
-CACHE_TTL = 43200  # 12시간 (오래된 상담 자동 정리)
+CACHE_TTL = 43200  # 12시간
 PING_INTERVAL = 30  # WebSocket ping 간격
-SYNC_INTERVAL = 60  # 데이터 동기화 간격
+SYNC_INTERVAL = 30  # 30초마다 시간 업데이트
 MAX_RECONNECT_ATTEMPTS = 5
 RECONNECT_DELAY = 5
 
@@ -62,6 +62,7 @@ class ChannelTalkMonitor:
         self._running = False
         self._sync_task = None
         self._cleanup_task = None
+        self._time_update_task = None
         logger.info("🚀 ChannelTalkMonitor 초기화")
         
     async def setup(self):
@@ -91,6 +92,7 @@ class ChannelTalkMonitor:
             self._running = True
             self._sync_task = asyncio.create_task(self._periodic_sync())
             self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
+            self._time_update_task = asyncio.create_task(self._periodic_time_update())
             
         except Exception as e:
             logger.error(f"❌ Redis 연결 실패: {e}")
@@ -100,7 +102,7 @@ class ChannelTalkMonitor:
         """종료시 정리"""
         self._running = False
         
-        for task in [self._sync_task, self._cleanup_task]:
+        for task in [self._sync_task, self._cleanup_task, self._time_update_task]:
             if task:
                 task.cancel()
                 try:
@@ -134,7 +136,12 @@ class ChannelTalkMonitor:
                         # 오래된 상담 체크 (12시간 이상)
                         timestamp = data.get('timestamp')
                         if timestamp:
-                            created = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                            # ISO 형식 파싱
+                            if isinstance(timestamp, str):
+                                created = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                            else:
+                                created = datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc)
+                            
                             age_hours = (current_time - created).total_seconds() / 3600
                             
                             if age_hours > 12:
@@ -193,6 +200,21 @@ class ChannelTalkMonitor:
             except Exception as e:
                 logger.error(f"정리 작업 오류: {e}")
     
+    async def _periodic_time_update(self):
+        """주기적 대기시간 업데이트"""
+        while self._running:
+            try:
+                await asyncio.sleep(30)  # 30초마다
+                # WebSocket으로 시간 업데이트 브로드캐스트
+                await self.broadcast({
+                    'type': 'time_update',
+                    'timestamp': datetime.now(timezone.utc).isoformat()
+                })
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"시간 업데이트 오류: {e}")
+    
     async def _cleanup_old_data(self):
         """12시간 이상 된 상담 자동 제거"""
         try:
@@ -208,7 +230,11 @@ class ChannelTalkMonitor:
                         data = json.loads(chat_data)
                         timestamp = data.get('timestamp')
                         if timestamp:
-                            created = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                            if isinstance(timestamp, str):
+                                created = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                            else:
+                                created = datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc)
+                            
                             age_hours = (current_time - created).total_seconds() / 3600
                             
                             if age_hours > 12:
@@ -303,7 +329,7 @@ class ChannelTalkMonitor:
             # 캐시 업데이트
             self.chat_cache[chat_id] = chat_data
             
-            logger.info(f"✅ 저장: {chat_id} - {chat_data.get('customerName', '익명')}")
+            logger.info(f"✅ 저장: {chat_id} - {chat_data.get('customerName', '익명')} - 담당: {chat_data.get('assignee', '없음')}")
             
             # WebSocket 브로드캐스트
             await self.broadcast({
@@ -414,15 +440,19 @@ class ChannelTalkMonitor:
             
             for chat in chats:
                 try:
-                    if isinstance(chat.get('timestamp'), str):
-                        created = datetime.fromisoformat(
-                            chat['timestamp'].replace('Z', '+00:00')
-                        )
+                    timestamp = chat.get('timestamp')
+                    if timestamp:
+                        # 문자열 또는 숫자 형식 처리
+                        if isinstance(timestamp, str):
+                            # ISO 형식 문자열
+                            created = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                        elif isinstance(timestamp, (int, float)):
+                            # Unix timestamp (밀리초)
+                            created = datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc)
+                        else:
+                            created = datetime.now(timezone.utc)
                     else:
-                        created = datetime.fromtimestamp(
-                            chat['timestamp'] / 1000, 
-                            tz=timezone.utc
-                        )
+                        created = datetime.now(timezone.utc)
                     
                     wait_seconds = (current_time - created).total_seconds()
                     
@@ -439,7 +469,8 @@ class ChannelTalkMonitor:
                             chat['team'] = MEMBER_TO_TEAM[chat['assignee']]
                     
                     valid_chats.append(chat)
-                except:
+                except Exception as e:
+                    logger.error(f"채팅 시간 계산 오류: {e}, chat: {chat}")
                     chat['waitMinutes'] = 0
                     chat['waitSeconds'] = 0
                     valid_chats.append(chat)
@@ -502,6 +533,9 @@ class ChannelTalkMonitor:
             data = await request.json()
             event_type = data.get('type')
             
+            # 디버깅용 로그
+            logger.debug(f"웹훅 수신: {json.dumps(data, ensure_ascii=False, indent=2)}")
+            
             # 비동기 처리로 응답 속도 향상
             if event_type == 'message':
                 asyncio.create_task(self.process_message(data))
@@ -533,18 +567,32 @@ class ChannelTalkMonitor:
                 user_info = refers.get('user', {})
                 user_chat = refers.get('userChat', {})
                 
-                # assignee 정보 추출 (여러 위치에서 시도)
-                assignee_info = user_chat.get('assignee') or entity.get('assignee', {})
+                # assignee 정보 추출 - 여러 위치에서 시도
                 assignee_name = None
                 assignee_team = None
                 
-                if assignee_info:
-                    assignee_name = assignee_info.get('name') or assignee_info.get('displayName')
-                    # 팀 매핑
-                    if assignee_name and assignee_name in MEMBER_TO_TEAM:
-                        assignee_team = MEMBER_TO_TEAM[assignee_name]
+                # 1. userChat의 assignee 확인
+                if user_chat and 'assignee' in user_chat:
+                    assignee = user_chat['assignee']
+                    if assignee:
+                        assignee_name = assignee.get('name') or assignee.get('displayName')
+                
+                # 2. refers의 최상위 assignee 확인
+                if not assignee_name and 'assignee' in refers:
+                    assignee = refers['assignee']
+                    if assignee:
+                        assignee_name = assignee.get('name') or assignee.get('displayName')
+                
+                # 팀 매핑
+                if assignee_name and assignee_name in MEMBER_TO_TEAM:
+                    assignee_team = MEMBER_TO_TEAM[assignee_name]
                 
                 logger.info(f"📌 담당자 정보: {assignee_name} ({assignee_team})")
+                
+                # timestamp 처리 - createdAt 우선 사용
+                timestamp = entity.get('createdAt')
+                if not timestamp:
+                    timestamp = datetime.now(timezone.utc).isoformat()
                 
                 chat_data = {
                     'id': str(chat_id),
@@ -555,9 +603,9 @@ class ChannelTalkMonitor:
                         '익명'
                     ),
                     'lastMessage': entity.get('plainText', ''),
-                    'timestamp': entity.get('createdAt', datetime.now(timezone.utc).isoformat()),
+                    'timestamp': timestamp,  # ISO 형식으로 저장
                     'channel': refers.get('channel', {}).get('name', ''),
-                    'tags': refers.get('userChat', {}).get('tags', []),
+                    'tags': user_chat.get('tags', []) if user_chat else [],
                     'assignee': assignee_name,
                     'team': assignee_team
                 }
@@ -567,18 +615,22 @@ class ChannelTalkMonitor:
             elif person_type in ['manager', 'bot']:
                 # 답변시 제거
                 manager_info = refers.get('manager', {})
-                manager_name = manager_info.get('name') or manager_info.get('displayName')
+                manager_name = None
+                
+                if manager_info:
+                    manager_name = manager_info.get('name') or manager_info.get('displayName')
                 
                 if not manager_name:
                     manager_name = 'Bot' if person_type == 'bot' else 'Unknown'
                 
                 # assignee 정보 가져오기
                 user_chat = refers.get('userChat', {})
-                assignee_info = user_chat.get('assignee') or entity.get('assignee', {})
                 assignee_name = None
                 
-                if assignee_info:
-                    assignee_name = assignee_info.get('name') or assignee_info.get('displayName')
+                if user_chat and 'assignee' in user_chat:
+                    assignee = user_chat['assignee']
+                    if assignee:
+                        assignee_name = assignee.get('name') or assignee.get('displayName')
                 
                 logger.info(f"💬 답변 처리: manager={manager_name}, assignee={assignee_name}")
                 
@@ -765,41 +817,37 @@ class ChannelTalkMonitor:
         """대시보드 HTML 제공"""
         return web.Response(text=DASHBOARD_HTML, content_type='text/html')
 
-# ===== 최적화된 대시보드 HTML =====
+# ===== 다크모드 대시보드 HTML =====
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>채널톡 미답변 상담 모니터링 프로그램</title>
+    <title>채널톡 실시간 모니터링</title>
     <style>
         :root {
-            /* 아정당 브랜드 컬러 */
-            --ajd-blue: #0066CC;
-            --ajd-blue-dark: #0052A3;
-            --ajd-blue-light: #E6F2FF;
-            
-            /* 배경색 */
-            --bg-primary: #FAFBFC;
-            --bg-secondary: #FFFFFF;
-            --bg-hover: #F5F7FA;
+            /* 다크모드 색상 */
+            --bg-primary: #0F0F0F;
+            --bg-secondary: #1A1A1A;
+            --bg-card: #252525;
+            --bg-hover: #2F2F2F;
             
             /* 텍스트 */
-            --text-primary: #1A1A1A;
-            --text-secondary: #6B7280;
-            --text-light: #9CA3AF;
+            --text-primary: #FFFFFF;
+            --text-secondary: #B0B0B0;
+            --text-dim: #808080;
             
             /* 상태 색상 */
-            --critical: #DC2626;
-            --warning: #F59E0B;
-            --caution: #EAB308;
-            --normal: #3B82F6;
-            --new: #10B981;
+            --critical: #FF4444;
+            --warning: #FF9F1C;
+            --caution: #FFD60A;
+            --normal: #4D7FFF;
+            --new: #00D68F;
             
             /* 기타 */
-            --border: #E5E7EB;
-            --shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+            --border: #333333;
+            --ajd-blue: #0066CC;
         }
 
         * { 
@@ -813,7 +861,6 @@ DASHBOARD_HTML = """
             background: var(--bg-primary);
             color: var(--text-primary);
             min-height: 100vh;
-            line-height: 1.5;
         }
 
         .container {
@@ -828,7 +875,6 @@ DASHBOARD_HTML = """
             border-radius: 8px;
             padding: 20px;
             margin-bottom: 20px;
-            box-shadow: var(--shadow);
             border: 1px solid var(--border);
         }
 
@@ -855,7 +901,8 @@ DASHBOARD_HTML = """
             padding: 6px 12px;
             border: 1px solid var(--border);
             border-radius: 6px;
-            background: white;
+            background: var(--bg-card);
+            color: var(--text-primary);
             font-size: 14px;
             cursor: pointer;
             outline: none;
@@ -874,11 +921,10 @@ DASHBOARD_HTML = """
             cursor: pointer;
             font-size: 14px;
             font-weight: 500;
-            transition: background 0.2s;
         }
 
         .refresh-btn:hover {
-            background: var(--ajd-blue-dark);
+            opacity: 0.9;
         }
 
         /* 통계 바 */
@@ -886,7 +932,6 @@ DASHBOARD_HTML = """
             display: flex;
             gap: 8px;
             overflow-x: auto;
-            padding: 4px 0;
         }
 
         .stat-item {
@@ -894,10 +939,10 @@ DASHBOARD_HTML = """
             align-items: center;
             gap: 8px;
             padding: 8px 16px;
-            background: var(--bg-hover);
+            background: var(--bg-card);
             border-radius: 6px;
+            border: 1px solid var(--border);
             white-space: nowrap;
-            min-width: fit-content;
         }
 
         .stat-label {
@@ -914,11 +959,11 @@ DASHBOARD_HTML = """
         /* 메인 레이아웃 */
         .main-layout {
             display: grid;
-            grid-template-columns: 1fr 300px;
+            grid-template-columns: 1fr 320px;
             gap: 20px;
         }
 
-        @media (max-width: 1024px) {
+        @media (max-width: 1200px) {
             .main-layout {
                 grid-template-columns: 1fr;
             }
@@ -928,7 +973,6 @@ DASHBOARD_HTML = """
         .chats-section {
             background: var(--bg-secondary);
             border-radius: 8px;
-            box-shadow: var(--shadow);
             overflow: hidden;
             border: 1px solid var(--border);
         }
@@ -936,7 +980,7 @@ DASHBOARD_HTML = """
         .table-header {
             padding: 12px 20px;
             border-bottom: 1px solid var(--border);
-            background: var(--bg-hover);
+            background: var(--bg-card);
             display: flex;
             justify-content: space-between;
             align-items: center;
@@ -960,14 +1004,12 @@ DASHBOARD_HTML = """
         }
 
         .filter-tab:hover {
-            background: white;
-            border-color: var(--border);
+            background: var(--bg-hover);
         }
 
         .filter-tab.active {
-            background: white;
-            color: var(--ajd-blue);
-            border-color: var(--ajd-blue);
+            background: var(--ajd-blue);
+            color: white;
         }
 
         /* 테이블 */
@@ -984,7 +1026,7 @@ DASHBOARD_HTML = """
             color: var(--text-secondary);
             text-transform: uppercase;
             letter-spacing: 0.5px;
-            background: var(--bg-hover);
+            background: var(--bg-card);
             border-bottom: 1px solid var(--border);
             position: sticky;
             top: 0;
@@ -998,13 +1040,13 @@ DASHBOARD_HTML = """
         }
 
         .chat-table tr {
-            background: white;
+            background: var(--bg-secondary);
             cursor: pointer;
             transition: background 0.1s;
         }
 
         .chat-table tr:hover {
-            background: var(--ajd-blue-light);
+            background: var(--bg-hover);
         }
 
         .customer-cell {
@@ -1055,7 +1097,6 @@ DASHBOARD_HTML = """
             background: var(--bg-secondary);
             border-radius: 8px;
             padding: 16px;
-            box-shadow: var(--shadow);
             border: 1px solid var(--border);
             height: fit-content;
         }
@@ -1077,7 +1118,7 @@ DASHBOARD_HTML = """
 
         .ranking-tab {
             padding: 6px;
-            background: var(--bg-hover);
+            background: var(--bg-card);
             border: 1px solid var(--border);
             border-radius: 4px;
             cursor: pointer;
@@ -1091,7 +1132,6 @@ DASHBOARD_HTML = """
         .ranking-tab.active {
             background: var(--ajd-blue);
             color: white;
-            border-color: var(--ajd-blue);
         }
 
         .ranking-list {
@@ -1105,7 +1145,7 @@ DASHBOARD_HTML = """
             align-items: center;
             gap: 8px;
             padding: 8px;
-            background: var(--bg-hover);
+            background: var(--bg-card);
             border-radius: 4px;
             font-size: 13px;
         }
@@ -1165,12 +1205,12 @@ DASHBOARD_HTML = """
         }
 
         ::-webkit-scrollbar-thumb {
-            background: #CBD5E1;
+            background: var(--border);
             border-radius: 4px;
         }
 
         ::-webkit-scrollbar-thumb:hover {
-            background: #94A3B8;
+            background: var(--ajd-blue);
         }
 
         /* 테이블 스크롤 컨테이너 */
@@ -1185,7 +1225,7 @@ DASHBOARD_HTML = """
         <!-- 헤더 -->
         <div class="header">
             <div class="header-top">
-                <h1 class="title">📊 채널톡 미답변 상담 모니터링 프로그램</h1>
+                <h1 class="title">⚡ 채널톡 실시간 모니터링</h1>
                 <div class="header-controls">
                     <select class="team-selector" id="teamSelector">
                         <option value="all">전체 팀</option>
@@ -1259,7 +1299,7 @@ DASHBOARD_HTML = """
             <!-- 랭킹 -->
             <div class="ranking-section">
                 <div class="ranking-header">
-                    답변 랭킹 (담당 외 상담 답변)
+                    답변 랭킹 (담당 외)
                 </div>
                 <div class="ranking-tabs">
                     <button class="ranking-tab active" data-ranking="daily">오늘</button>
@@ -1301,6 +1341,20 @@ DASHBOARD_HTML = """
             const hours = Math.floor(minutes / 60);
             const mins = minutes % 60;
             return mins > 0 ? `${hours}시간 ${mins}분` : `${hours}시간`;
+        }
+
+        // 실시간 시간 업데이트
+        function updateWaitTimes() {
+            const now = new Date();
+            allChats.forEach(chat => {
+                if (chat.timestamp) {
+                    const created = new Date(chat.timestamp);
+                    const waitSeconds = Math.floor((now - created) / 1000);
+                    chat.waitMinutes = Math.max(0, Math.floor(waitSeconds / 60));
+                    chat.waitSeconds = Math.max(0, waitSeconds);
+                }
+            });
+            renderTable();
         }
 
         // 테이블 렌더링
@@ -1399,7 +1453,7 @@ DASHBOARD_HTML = """
             
             selector.innerHTML = '<option value="all">전체 팀</option>';
             teams.forEach(team => {
-                selector.innerHTML += `<option value="${team}">${team} 팀</option>`;
+                selector.innerHTML += `<option value="${team}">${team}</option>`;
             });
             
             selector.value = currentValue;
@@ -1447,6 +1501,8 @@ DASHBOARD_HTML = """
                     if (data.manager) {
                         fetchData();
                     }
+                } else if (data.type === 'time_update') {
+                    updateWaitTimes();
                 }
             };
             
@@ -1521,7 +1577,12 @@ DASHBOARD_HTML = """
         // 초기화
         connectWebSocket();
         fetchData();
-        setInterval(fetchData, 30000); // 30초마다 동기화
+        
+        // 30초마다 시간 업데이트
+        setInterval(updateWaitTimes, 30000);
+        
+        // 1분마다 데이터 동기화
+        setInterval(fetchData, 60000);
     </script>
 </body>
 </html>
@@ -1566,7 +1627,7 @@ async def create_app():
     # 시작/종료 핸들러
     async def on_startup(app):
         logger.info("=" * 60)
-        logger.info("📊 채널톡 미답변 상담 모니터링 프로그램")
+        logger.info("⚡ 채널톡 실시간 모니터링 시스템")
         logger.info(f"📌 대시보드: http://localhost:{PORT}")
         logger.info(f"🔌 WebSocket: ws://localhost:{PORT}/ws")
         logger.info(f"🎯 웹훅: http://localhost:{PORT}/webhook")

@@ -1,28 +1,372 @@
-<!DOCTYPE html>
+# main.py - 아정당 미답변 상담 모니터링 (심플 버전)
+
+import asyncio
+import json
+import logging
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Set
+import httpx
+import os
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, HTMLResponse
+import redis.asyncio as redis
+from pydantic import BaseModel
+import uvicorn
+
+# 로깅 설정
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# 채널톡 API 설정
+CHANNEL_ID = "197228"
+API_ACCESS_KEY = "688a26176fcb19aebf8b"
+API_SECRET = "a0db6c38b95c8ec4d9bb46e7c653b3e2"
+CHANNEL_API_BASE = "https://api.channel.io/open/v5"
+
+# Redis 설정
+REDIS_URL = os.getenv("REDIS_URL", "redis://red-d2ct46buibrs738rintg:6379")
+WEBHOOK_TOKEN = "80ab2d11835f44b89010c8efa5eec4b4"
+
+# 팀 매핑
+TEAM_MAPPING = {
+    # 매니저 ID나 이름을 기준으로 팀 매핑 (실제 데이터로 수정 필요)
+    "default": "SNS 1팀"
+}
+
+app = FastAPI(title="아정당 미답변 상담")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class Consultation(BaseModel):
+    id: str
+    team: str  # 담당자 팀
+    manager: str  # 담당자
+    last_message: str  # 고객 마지막 메시지
+    wait_minutes: int  # 대기 시간(분)
+    last_message_time: datetime
+
+class ChannelAPI:
+    def __init__(self):
+        self.headers = {
+            "x-access-key": API_ACCESS_KEY,
+            "x-access-secret": API_SECRET,
+            "Content-Type": "application/json"
+        }
+        self.client = httpx.AsyncClient(timeout=30.0)
+        
+    async def get_managers(self) -> Dict[str, str]:
+        """매니저 목록 조회 및 팀 매핑"""
+        try:
+            response = await self.client.get(
+                f"{CHANNEL_API_BASE}/managers",
+                headers=self.headers
+            )
+            
+            if response.status_code == 200:
+                managers = response.json().get("managers", [])
+                manager_teams = {}
+                
+                for manager in managers:
+                    manager_id = manager.get("id")
+                    manager_name = manager.get("name", "")
+                    
+                    # 이름이나 설명에서 팀 정보 추출
+                    team = "미배정"
+                    if "SNS 1" in manager_name or "SNS1" in manager_name:
+                        team = "SNS 1팀"
+                    elif "SNS 2" in manager_name or "SNS2" in manager_name:
+                        team = "SNS 2팀"
+                    elif "SNS 3" in manager_name or "SNS3" in manager_name:
+                        team = "SNS 3팀"
+                    elif "SNS 4" in manager_name or "SNS4" in manager_name:
+                        team = "SNS 4팀"
+                    elif "의정부" in manager_name:
+                        team = "의정부 SNS팀"
+                    
+                    manager_teams[manager_id] = {
+                        "name": manager_name,
+                        "team": team
+                    }
+                
+                return manager_teams
+            return {}
+            
+        except Exception as e:
+            logger.error(f"매니저 조회 실패: {e}")
+            return {}
+    
+    async def get_unanswered(self) -> List[Dict]:
+        """미답변 상담 조회"""
+        try:
+            # 열린 상담 조회
+            response = await self.client.get(
+                f"{CHANNEL_API_BASE}/user-chats",
+                headers=self.headers,
+                params={
+                    "state": "opened",
+                    "limit": 500,
+                    "sortOrder": "-updatedAt"
+                }
+            )
+            
+            if response.status_code != 200:
+                return []
+            
+            chats = response.json().get("userChats", [])
+            unanswered = []
+            
+            # 매니저 정보 가져오기
+            managers = await self.get_managers()
+            
+            for chat in chats:
+                chat_id = chat.get("id")
+                
+                # 마지막 메시지 확인
+                msg_response = await self.client.get(
+                    f"{CHANNEL_API_BASE}/user-chats/{chat_id}/messages",
+                    headers=self.headers,
+                    params={"limit": 1, "sortOrder": "-createdAt"}
+                )
+                
+                if msg_response.status_code == 200:
+                    messages = msg_response.json().get("messages", [])
+                    if messages and messages[0].get("personType") == "user":
+                        # 담당자 정보
+                        assignee = chat.get("assignee", {})
+                        manager_id = assignee.get("id", "")
+                        manager_info = managers.get(manager_id, {})
+                        
+                        unanswered.append({
+                            "id": chat_id,
+                            "team": manager_info.get("team", "미배정"),
+                            "manager": manager_info.get("name", assignee.get("name", "미배정")),
+                            "last_message": messages[0].get("message", ""),
+                            "last_message_time": messages[0].get("createdAt", "")
+                        })
+            
+            return unanswered
+            
+        except Exception as e:
+            logger.error(f"미답변 조회 실패: {e}")
+            return []
+
+class Manager:
+    def __init__(self, redis_client: redis.Redis, api: ChannelAPI):
+        self.redis = redis_client
+        self.api = api
+        
+    async def sync(self):
+        """API 동기화"""
+        try:
+            unanswered = await self.api.get_unanswered()
+            
+            # Redis 초기화
+            await self.redis.delete("consultations")
+            
+            # 데이터 저장
+            pipe = self.redis.pipeline()
+            for chat in unanswered:
+                # 대기시간 계산
+                msg_time = datetime.fromisoformat(chat["last_message_time"].replace("Z", "+00:00"))
+                wait_minutes = int((datetime.now(timezone.utc) - msg_time).total_seconds() / 60)
+                
+                consultation = Consultation(
+                    id=chat["id"],
+                    team=chat["team"],
+                    manager=chat["manager"],
+                    last_message=chat["last_message"],
+                    wait_minutes=wait_minutes,
+                    last_message_time=msg_time
+                )
+                
+                pipe.hset("consultations", chat["id"], consultation.json())
+            
+            await pipe.execute()
+            
+            logger.info(f"✅ 동기화 완료: {len(unanswered)}개")
+            
+            # WebSocket 브로드캐스트
+            await self.broadcast_update()
+            
+        except Exception as e:
+            logger.error(f"동기화 실패: {e}")
+    
+    async def process_webhook(self, data: Dict):
+        """웹훅 처리"""
+        try:
+            event_type = data.get("type")
+            
+            if event_type == "message":
+                message = data.get("message", {})
+                chat_id = message.get("chatId")
+                person_type = message.get("personType")
+                
+                if person_type == "user":
+                    # 고객 메시지 - 미답변 추가
+                    await self.add_unanswered(chat_id)
+                elif person_type == "manager":
+                    # 상담사 응답 - 제거
+                    await self.remove_consultation(chat_id)
+                    
+        except Exception as e:
+            logger.error(f"웹훅 처리 실패: {e}")
+    
+    async def add_unanswered(self, chat_id: str):
+        """미답변 추가"""
+        # API에서 상세 정보 가져와서 추가
+        await self.sync()  # 간단하게 전체 동기화
+    
+    async def remove_consultation(self, chat_id: str):
+        """상담 제거"""
+        await self.redis.hdel("consultations", chat_id)
+        await self.broadcast_update()
+    
+    async def get_all(self) -> List[Dict]:
+        """전체 조회"""
+        try:
+            data = await self.redis.hgetall("consultations")
+            consultations = []
+            
+            for item in data.values():
+                consultation = json.loads(item)
+                # 대기시간 재계산
+                msg_time = datetime.fromisoformat(consultation["last_message_time"])
+                wait_minutes = int((datetime.now(timezone.utc) - msg_time).total_seconds() / 60)
+                consultation["wait_minutes"] = wait_minutes
+                consultations.append(consultation)
+            
+            # 대기시간 순 정렬
+            consultations.sort(key=lambda x: x["wait_minutes"], reverse=True)
+            
+            return consultations
+            
+        except Exception as e:
+            logger.error(f"조회 실패: {e}")
+            return []
+    
+    async def broadcast_update(self):
+        """WebSocket 브로드캐스트"""
+        consultations = await self.get_all()
+        message = json.dumps({
+            "type": "update",
+            "data": consultations
+        })
+        
+        disconnected = set()
+        for ws in active_websockets:
+            try:
+                await ws.send_text(message)
+            except:
+                disconnected.add(ws)
+        
+        active_websockets.difference_update(disconnected)
+    
+    async def periodic_sync(self):
+        """주기적 동기화"""
+        while True:
+            await asyncio.sleep(10)
+            await self.sync()
+
+# 전역 변수
+redis_client: Optional[redis.Redis] = None
+api_client: Optional[ChannelAPI] = None
+manager: Optional[Manager] = None
+active_websockets: Set[WebSocket] = set()
+
+@app.on_event("startup")
+async def startup():
+    global redis_client, api_client, manager
+    
+    try:
+        redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+        await redis_client.ping()
+        logger.info("✅ Redis 연결")
+        
+        api_client = ChannelAPI()
+        manager = Manager(redis_client, api_client)
+        
+        # 초기 동기화
+        await manager.sync()
+        
+        # 주기적 동기화
+        asyncio.create_task(manager.periodic_sync())
+        
+        logger.info("✅ 서버 시작")
+        
+    except Exception as e:
+        logger.error(f"❌ 시작 실패: {e}")
+
+@app.on_event("shutdown")
+async def shutdown():
+    if redis_client:
+        await redis_client.close()
+
+@app.post("/webhook")
+async def webhook(request: Request, token: str = Query(...)):
+    if token != WEBHOOK_TOKEN:
+        raise HTTPException(status_code=401)
+    
+    try:
+        body = await request.json()
+        await manager.process_webhook(body)
+        return {"status": "ok"}
+    except Exception as e:
+        logger.error(f"웹훅 실패: {e}")
+        return {"status": "error"}
+
+@app.get("/api/consultations")
+async def get_consultations():
+    consultations = await manager.get_all()
+    return JSONResponse(consultations)
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    active_websockets.add(websocket)
+    
+    try:
+        # 초기 데이터
+        consultations = await manager.get_all()
+        await websocket.send_json({
+            "type": "initial",
+            "data": consultations
+        })
+        
+        while True:
+            await websocket.receive_text()
+            
+    except WebSocketDisconnect:
+        active_websockets.remove(websocket)
+
+@app.get("/health")
+async def health():
+    try:
+        await redis_client.ping()
+        return {"status": "ok"}
+    except:
+        raise HTTPException(status_code=503)
+
+@app.get("/")
+async def index():
+    """메인 페이지"""
+    html_content = """<!DOCTYPE html>
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>아정당 실시간 상담 모니터링</title>
+    <title>미답변 상담</title>
     <style>
-        :root {
-            --ajungdang-blue: #0066CC;
-            --ajungdang-blue-light: #3399FF;
-            --ajungdang-blue-dark: #004499;
-            --bg-primary: #0A0E1A;
-            --bg-secondary: #151B2C;
-            --bg-card: #1C2333;
-            --bg-hover: #242B3D;
-            --text-primary: #E8EAED;
-            --text-secondary: #9CA3AF;
-            --text-muted: #6B7280;
-            --border-color: #2A3142;
-            --success: #10B981;
-            --warning: #F59E0B;
-            --danger: #EF4444;
-            --gradient-blue: linear-gradient(135deg, var(--ajungdang-blue) 0%, var(--ajungdang-blue-light) 100%);
-        }
-
         * {
             margin: 0;
             padding: 0;
@@ -30,847 +374,319 @@
         }
 
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            background: var(--bg-primary);
-            color: var(--text-primary);
-            line-height: 1.6;
-            overflow-x: hidden;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #0A0B0E;
+            color: #FFFFFF;
+            padding: 20px;
         }
 
-        /* 헤더 */
         .header {
-            background: linear-gradient(180deg, var(--bg-secondary) 0%, rgba(21, 27, 44, 0) 100%);
-            padding: 2rem 0;
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            z-index: 1000;
-            backdrop-filter: blur(20px);
-            border-bottom: 1px solid var(--border-color);
-        }
-
-        .header-content {
-            max-width: 1400px;
-            margin: 0 auto;
-            padding: 0 2rem;
             display: flex;
             justify-content: space-between;
             align-items: center;
-        }
-
-        .logo-section {
-            display: flex;
-            align-items: center;
-            gap: 1rem;
-        }
-
-        .logo {
-            width: 40px;
-            height: 40px;
-            background: var(--gradient-blue);
-            border-radius: 12px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-weight: bold;
-            font-size: 1.2rem;
-            box-shadow: 0 4px 20px rgba(0, 102, 204, 0.3);
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid #2A2E38;
         }
 
         .title {
-            font-size: 1.5rem;
-            font-weight: 700;
-            background: var(--gradient-blue);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
+            font-size: 24px;
+            font-weight: 600;
+            color: #0066CC;
         }
 
-        .connection-status {
+        .status {
             display: flex;
             align-items: center;
-            gap: 0.5rem;
-            padding: 0.5rem 1rem;
-            background: var(--bg-card);
-            border-radius: 20px;
-            border: 1px solid var(--border-color);
+            gap: 8px;
+            font-size: 14px;
+            color: #94A3B8;
         }
 
         .status-dot {
             width: 8px;
             height: 8px;
             border-radius: 50%;
-            background: var(--success);
-            animation: pulse 2s infinite;
-        }
-
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.5; }
+            background: #22C55E;
         }
 
         .status-dot.disconnected {
-            background: var(--danger);
-            animation: none;
+            background: #EF4444;
         }
 
-        /* 메인 컨테이너 */
-        .main-container {
-            max-width: 1400px;
-            margin: 7rem auto 2rem;
-            padding: 0 2rem;
-        }
-
-        /* 통계 카드 */
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 1.5rem;
-            margin-bottom: 2rem;
-        }
-
-        .stat-card {
-            background: var(--bg-card);
-            border: 1px solid var(--border-color);
-            border-radius: 16px;
-            padding: 1.5rem;
-            position: relative;
+        .table-container {
+            background: #12141A;
+            border-radius: 8px;
             overflow: hidden;
-            transition: all 0.3s ease;
+            border: 1px solid #2A2E38;
         }
 
-        .stat-card:hover {
-            transform: translateY(-2px);
-            border-color: var(--ajungdang-blue);
-            box-shadow: 0 8px 32px rgba(0, 102, 204, 0.2);
+        table {
+            width: 100%;
+            border-collapse: collapse;
         }
 
-        .stat-card::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            height: 3px;
-            background: var(--gradient-blue);
+        thead {
+            background: #1A1D24;
         }
 
-        .stat-label {
-            color: var(--text-secondary);
-            font-size: 0.875rem;
-            margin-bottom: 0.5rem;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-
-        .stat-value {
-            font-size: 2rem;
-            font-weight: 700;
-            color: var(--text-primary);
-            display: flex;
-            align-items: baseline;
-            gap: 0.5rem;
-        }
-
-        .stat-change {
-            font-size: 0.875rem;
-            padding: 0.25rem 0.5rem;
-            border-radius: 6px;
-            background: rgba(16, 185, 129, 0.1);
-            color: var(--success);
-        }
-
-        .stat-change.negative {
-            background: rgba(239, 68, 68, 0.1);
-            color: var(--danger);
-        }
-
-        /* 상담 리스트 */
-        .consultations-section {
-            background: var(--bg-card);
-            border: 1px solid var(--border-color);
-            border-radius: 16px;
-            overflow: hidden;
-        }
-
-        .section-header {
-            padding: 1.5rem;
-            background: var(--bg-secondary);
-            border-bottom: 1px solid var(--border-color);
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-
-        .section-title {
-            font-size: 1.25rem;
+        th {
+            text-align: left;
+            padding: 12px 16px;
+            font-size: 12px;
             font-weight: 600;
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-        }
-
-        .filter-buttons {
-            display: flex;
-            gap: 0.5rem;
-        }
-
-        .filter-btn {
-            padding: 0.5rem 1rem;
-            background: var(--bg-card);
-            border: 1px solid var(--border-color);
-            border-radius: 8px;
-            color: var(--text-secondary);
-            cursor: pointer;
-            transition: all 0.2s ease;
-            font-size: 0.875rem;
-        }
-
-        .filter-btn:hover {
-            background: var(--bg-hover);
-            color: var(--text-primary);
-        }
-
-        .filter-btn.active {
-            background: var(--ajungdang-blue);
-            color: white;
-            border-color: var(--ajungdang-blue);
-        }
-
-        .consultations-list {
-            max-height: 600px;
-            overflow-y: auto;
-        }
-
-        .consultations-list::-webkit-scrollbar {
-            width: 8px;
-        }
-
-        .consultations-list::-webkit-scrollbar-track {
-            background: var(--bg-secondary);
-        }
-
-        .consultations-list::-webkit-scrollbar-thumb {
-            background: var(--ajungdang-blue);
-            border-radius: 4px;
-        }
-
-        .consultation-item {
-            padding: 1.5rem;
-            border-bottom: 1px solid var(--border-color);
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            transition: all 0.2s ease;
-            cursor: pointer;
-            animation: slideIn 0.3s ease;
-        }
-
-        @keyframes slideIn {
-            from {
-                opacity: 0;
-                transform: translateX(-20px);
-            }
-            to {
-                opacity: 1;
-                transform: translateX(0);
-            }
-        }
-
-        .consultation-item:hover {
-            background: var(--bg-hover);
-        }
-
-        .consultation-item.new {
-            border-left: 3px solid var(--ajungdang-blue);
-            background: linear-gradient(90deg, rgba(0, 102, 204, 0.1) 0%, transparent 100%);
-        }
-
-        .consultation-info {
-            flex: 1;
-        }
-
-        .consultation-id {
-            font-size: 0.875rem;
-            color: var(--text-secondary);
-            margin-bottom: 0.25rem;
-            font-family: 'Courier New', monospace;
-        }
-
-        .consultation-customer {
-            font-size: 1.125rem;
-            font-weight: 500;
-            color: var(--text-primary);
-            margin-bottom: 0.5rem;
-        }
-
-        .consultation-meta {
-            display: flex;
-            gap: 1rem;
-            font-size: 0.875rem;
-            color: var(--text-muted);
-        }
-
-        .meta-item {
-            display: flex;
-            align-items: center;
-            gap: 0.25rem;
-        }
-
-        .consultation-status {
-            display: flex;
-            flex-direction: column;
-            align-items: flex-end;
-            gap: 0.5rem;
-        }
-
-        .status-badge {
-            padding: 0.375rem 0.75rem;
-            border-radius: 20px;
-            font-size: 0.75rem;
-            font-weight: 500;
+            color: #94A3B8;
             text-transform: uppercase;
             letter-spacing: 0.5px;
+            border-bottom: 1px solid #2A2E38;
         }
 
-        .status-badge.waiting {
-            background: rgba(245, 158, 11, 0.1);
-            color: var(--warning);
-            border: 1px solid var(--warning);
-        }
-
-        .status-badge.urgent {
-            background: rgba(239, 68, 68, 0.1);
-            color: var(--danger);
-            border: 1px solid var(--danger);
-            animation: blink 1s infinite;
-        }
-
-        @keyframes blink {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.5; }
-        }
-
-        .time-waiting {
-            font-size: 0.875rem;
-            color: var(--text-secondary);
-        }
-
-        /* 액션 버튼 */
-        .action-btn {
-            padding: 0.5rem 1rem;
-            background: var(--gradient-blue);
-            border: none;
-            border-radius: 8px;
-            color: white;
-            font-weight: 500;
+        tbody tr {
+            border-bottom: 1px solid #2A2E38;
             cursor: pointer;
-            transition: all 0.2s ease;
-            box-shadow: 0 4px 12px rgba(0, 102, 204, 0.3);
+            transition: background 0.1s;
         }
 
-        .action-btn:hover {
-            transform: translateY(-1px);
-            box-shadow: 0 6px 20px rgba(0, 102, 204, 0.4);
+        tbody tr:hover {
+            background: #1A1D24;
         }
 
-        /* 빈 상태 */
-        .empty-state {
-            padding: 4rem 2rem;
+        td {
+            padding: 12px 16px;
+            font-size: 14px;
+            color: #E8EAED;
+        }
+
+        .team {
+            font-weight: 500;
+            color: #0066CC;
+        }
+
+        .manager {
+            color: #94A3B8;
+        }
+
+        .message {
+            max-width: 500px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            color: #E8EAED;
+        }
+
+        .wait-time {
+            font-weight: 600;
+            padding: 4px 8px;
+            border-radius: 4px;
+            display: inline-block;
+            min-width: 60px;
             text-align: center;
-            color: var(--text-secondary);
         }
 
-        .empty-icon {
-            font-size: 3rem;
-            margin-bottom: 1rem;
-            opacity: 0.5;
+        /* 대기시간 색상 */
+        .wait-green {
+            background: rgba(34, 197, 94, 0.2);
+            color: #22C55E;
         }
 
-        /* 실시간 인디케이터 */
-        .live-indicator {
-            position: fixed;
-            bottom: 2rem;
-            right: 2rem;
-            background: var(--bg-card);
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
-            padding: 1rem;
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+        .wait-blue {
+            background: rgba(0, 102, 204, 0.2);
+            color: #0066CC;
         }
 
-        .live-dot {
-            width: 12px;
-            height: 12px;
-            background: var(--danger);
-            border-radius: 50%;
-            animation: livePulse 1.5s ease-in-out infinite;
+        .wait-yellow {
+            background: rgba(245, 158, 11, 0.2);
+            color: #F59E0B;
         }
 
-        @keyframes livePulse {
-            0% {
-                box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7);
-            }
-            70% {
-                box-shadow: 0 0 0 10px rgba(239, 68, 68, 0);
-            }
-            100% {
-                box-shadow: 0 0 0 0 rgba(239, 68, 68, 0);
-            }
+        .wait-orange {
+            background: rgba(251, 146, 60, 0.2);
+            color: #FB923C;
         }
 
-        /* 로딩 스피너 */
-        .loading-spinner {
-            width: 40px;
-            height: 40px;
-            border: 3px solid var(--border-color);
-            border-top-color: var(--ajungdang-blue);
-            border-radius: 50%;
-            animation: spin 1s linear infinite;
-            margin: 2rem auto;
+        .wait-red {
+            background: rgba(239, 68, 68, 0.2);
+            color: #EF4444;
         }
 
-        @keyframes spin {
-            to { transform: rotate(360deg); }
+        .empty {
+            text-align: center;
+            padding: 40px;
+            color: #64748B;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #94A3B8;
         }
     </style>
 </head>
 <body>
-    <!-- 헤더 -->
-    <header class="header">
-        <div class="header-content">
-            <div class="logo-section">
-                <div class="logo">아</div>
-                <h1 class="title">아정당 실시간 상담 모니터링</h1>
-            </div>
-            <div class="connection-status">
-                <div class="status-dot" id="connectionStatus"></div>
-                <span id="connectionText">연결됨</span>
-            </div>
+    <div class="header">
+        <h1 class="title">미답변 상담</h1>
+        <div class="status">
+            <div class="status-dot" id="statusDot"></div>
+            <span id="statusText">연결 중...</span>
         </div>
-    </header>
+    </div>
 
-    <!-- 메인 컨테이너 -->
-    <main class="main-container">
-        <!-- 통계 카드 -->
-        <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-label">대기 중인 상담</div>
-                <div class="stat-value">
-                    <span id="waitingCount">0</span>
-                    <span class="stat-change" id="waitingChange">+0</span>
-                </div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">긴급 상담</div>
-                <div class="stat-value">
-                    <span id="urgentCount">0</span>
-                    <span class="stat-change negative" id="urgentChange">0</span>
-                </div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">평균 대기 시간</div>
-                <div class="stat-value">
-                    <span id="avgWaitTime">0분</span>
-                </div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">오늘 총 상담</div>
-                <div class="stat-value">
-                    <span id="totalToday">0</span>
-                </div>
-            </div>
-        </div>
-
-        <!-- 상담 리스트 -->
-        <div class="consultations-section">
-            <div class="section-header">
-                <h2 class="section-title">
-                    <span>📋</span>
-                    미답변 상담 목록
-                </h2>
-                <div class="filter-buttons">
-                    <button class="filter-btn active" data-filter="all">전체</button>
-                    <button class="filter-btn" data-filter="urgent">긴급</button>
-                    <button class="filter-btn" data-filter="recent">최신순</button>
-                    <button class="filter-btn" data-filter="oldest">오래된순</button>
-                </div>
-            </div>
-            <div class="consultations-list" id="consultationsList">
-                <div class="loading-spinner"></div>
-            </div>
-        </div>
-    </main>
-
-    <!-- 실시간 인디케이터 -->
-    <div class="live-indicator">
-        <div class="live-dot"></div>
-        <span>실시간 모니터링 중</span>
+    <div class="table-container">
+        <table>
+            <thead>
+                <tr>
+                    <th>팀</th>
+                    <th>담당자</th>
+                    <th>마지막 메시지</th>
+                    <th>대기시간</th>
+                </tr>
+            </thead>
+            <tbody id="consultationList">
+                <tr>
+                    <td colspan="4" class="loading">데이터 로딩 중...</td>
+                </tr>
+            </tbody>
+        </table>
     </div>
 
     <script>
-        // 백엔드 서버 URL 설정 (실제 배포시 변경)
-        const API_BASE = window.location.origin; // 같은 도메인 사용
-        const WS_URL = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws`;
+        const CHANNEL_ID = '197228';
         
-        class ConsultationMonitor {
+        class Monitor {
             constructor() {
-                this.consultations = new Map();
                 this.ws = null;
+                this.consultations = [];
                 this.reconnectAttempts = 0;
-                this.maxReconnectAttempts = 10;
-                this.reconnectDelay = 1000;
-                this.stats = {
-                    waiting: 0,
-                    urgent: 0,
-                    avgWaitTime: 0,
-                    totalToday: 0
-                };
-                this.currentFilter = 'all';
                 this.init();
             }
 
             init() {
-                this.connectWebSocket();
-                this.setupEventListeners();
-                this.startPeriodicUpdate();
+                this.connect();
+                this.startTimer();
             }
 
-            connectWebSocket() {
+            connect() {
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                const wsUrl = `${protocol}//${window.location.host}/ws`;
+                
                 try {
-                    this.ws = new WebSocket(WS_URL);
+                    this.ws = new WebSocket(wsUrl);
                     
                     this.ws.onopen = () => {
-                        console.log('✅ WebSocket 연결 성공');
-                        this.updateConnectionStatus(true);
+                        console.log('WebSocket 연결됨');
+                        this.updateStatus(true);
                         this.reconnectAttempts = 0;
-                        this.reconnectDelay = 1000;
                     };
 
                     this.ws.onmessage = (event) => {
                         const data = JSON.parse(event.data);
-                        this.handleWebSocketMessage(data);
+                        this.handleMessage(data);
                     };
 
                     this.ws.onclose = () => {
-                        console.log('⚠️ WebSocket 연결 끊김');
-                        this.updateConnectionStatus(false);
-                        this.handleReconnect();
+                        console.log('WebSocket 연결 끊김');
+                        this.updateStatus(false);
+                        this.reconnect();
                     };
 
                     this.ws.onerror = (error) => {
-                        console.error('❌ WebSocket 에러:', error);
-                        this.updateConnectionStatus(false);
+                        console.error('WebSocket 에러:', error);
+                        this.updateStatus(false);
                     };
                     
                 } catch (error) {
                     console.error('WebSocket 연결 실패:', error);
-                    this.updateConnectionStatus(false);
-                    this.handleReconnect();
+                    this.updateStatus(false);
+                    this.reconnect();
                 }
             }
 
-            handleReconnect() {
-                if (this.reconnectAttempts < this.maxReconnectAttempts) {
+            reconnect() {
+                if (this.reconnectAttempts < 10) {
                     this.reconnectAttempts++;
-                    console.log(`재연결 시도 ${this.reconnectAttempts}/${this.maxReconnectAttempts}`);
-                    setTimeout(() => {
-                        this.connectWebSocket();
-                    }, this.reconnectDelay);
-                    this.reconnectDelay = Math.min(this.reconnectDelay * 2, 30000); // 최대 30초
-                } else {
-                    console.error('최대 재연결 시도 횟수 초과');
-                    this.showNotification('연결 실패', ' 서버 연결이 끊어졌습니다. 페이지를 새로고침해주세요.');
+                    setTimeout(() => this.connect(), 2000);
                 }
             }
 
-            generateId() {
-                return Date.now().toString(36) + Math.random().toString(36).substr(2, 9);
-            }
-
-            handleWebSocketMessage(data) {
-                switch (data.type) {
-                    case 'initial_data':
-                        // 초기 데이터 로드
-                        this.consultations.clear();
-                        data.consultations.forEach(consultation => {
-                            consultation.created_at = new Date(consultation.created_at);
-                            this.consultations.set(consultation.id, consultation);
-                        });
-                        this.stats = data.stats;
-                        this.updateDisplay();
-                        this.updateStatsDisplay();
-                        break;
-                        
-                    case 'new_consultation':
-                        // 새 상담 추가
-                        const newConsultation = data.data;
-                        newConsultation.created_at = new Date(newConsultation.created_at);
-                        this.addConsultation(newConsultation);
-                        break;
-                        
-                    case 'consultation_answered':
-                        // 상담 답변 완료
-                        this.removeConsultation(data.data.consultation_id);
-                        break;
-                        
-                    case 'stats_update':
-                        // 통계 업데이트
-                        this.stats = data.stats;
-                        this.updateStatsDisplay();
-                        break;
-                        
-                    default:
-                        console.log('알 수 없는 메시지 타입:', data.type);
+            handleMessage(data) {
+                if (data.type === 'initial' || data.type === 'update') {
+                    this.consultations = data.data || [];
+                    this.render();
                 }
             }
 
-            async loadInitialData() {
-                try {
-                    // REST API로 초기 데이터 로드 (WebSocket 연결 실패시 대비)
-                    const [consultationsRes, statsRes] = await Promise.all([
-                        fetch(`${API_BASE}/api/consultations`),
-                        fetch(`${API_BASE}/api/stats`)
-                    ]);
-                    
-                    if (consultationsRes.ok && statsRes.ok) {
-                        const consultations = await consultationsRes.json();
-                        const stats = await statsRes.json();
-                        
-                        this.consultations.clear();
-                        consultations.forEach(consultation => {
-                            consultation.created_at = new Date(consultation.created_at);
-                            this.consultations.set(consultation.id, consultation);
-                        });
-                        
-                        this.stats = stats;
-                        this.updateDisplay();
-                        this.updateStatsDisplay();
-                    }
-                } catch (error) {
-                    console.error('초기 데이터 로드 실패:', error);
-                }
-            }
-
-            addConsultation(consultation) {
-                if (!consultation.created_at) {
-                    consultation.created_at = new Date();
-                }
-                this.consultations.set(consultation.id, consultation);
-                this.updateDisplay();
-                this.updateStats();
+            render() {
+                const tbody = document.getElementById('consultationList');
                 
-                // 알림 표시
-                this.showNotification('새 상담', `${consultation.customer || 'Unknown'}님의 상담이 접수되었습니다.`);
-                
-                // 긴급 상담인 경우 추가 알림
-                if (consultation.status === 'urgent' || consultation.wait_time_minutes > 15) {
-                    this.showNotification('⚠️ 긴급 상담', `${consultation.customer || 'Unknown'}님이 ${consultation.wait_time_minutes}분째 대기 중입니다.`);
-                }
-            }
-
-            removeConsultation(consultationId) {
-                if (this.consultations.has(consultationId)) {
-                    const consultation = this.consultations.get(consultationId);
-                    this.consultations.delete(consultationId);
-                    this.updateDisplay();
-                    this.updateStats();
-                    
-                    // 상담 완료 알림
-                    this.showNotification('상담 완료', `${consultation.customer || 'Unknown'}님의 상담이 처리되었습니다.`);
-                }
-            }
-
-            updateDisplay() {
-                const listElement = document.getElementById('consultationsList');
-                const consultationsArray = Array.from(this.consultations.values());
-                
-                // 필터링
-                let filtered = consultationsArray;
-                switch (this.currentFilter) {
-                    case 'urgent':
-                        filtered = consultationsArray.filter(c => c.status === 'urgent' || c.wait_time_minutes > 15);
-                        break;
-                    case 'recent':
-                        filtered = consultationsArray.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-                        break;
-                    case 'oldest':
-                        filtered = consultationsArray.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
-                        break;
-                }
-
-                if (filtered.length === 0) {
-                    listElement.innerHTML = `
-                        <div class="empty-state">
-                            <div class="empty-icon">🎉</div>
-                            <p>모든 상담이 처리되었습니다!</p>
-                        </div>
-                    `;
+                if (this.consultations.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="4" class="empty">미답변 상담이 없습니다</td></tr>';
                     return;
                 }
 
-                listElement.innerHTML = filtered.map(consultation => {
-                    const createdAt = new Date(consultation.created_at);
-                    const waitMinutes = consultation.wait_time_minutes || Math.floor((Date.now() - createdAt) / 60000);
-                    const isNew = (Date.now() - createdAt) < 60000;
-                    const isUrgent = consultation.status === 'urgent' || waitMinutes > 15;
+                tbody.innerHTML = this.consultations.map(c => {
+                    const waitClass = this.getWaitClass(c.wait_minutes);
                     
                     return `
-                        <div class="consultation-item ${isNew ? 'new' : ''}" data-id="${consultation.id}">
-                            <div class="consultation-info">
-                                <div class="consultation-id">ID: ${consultation.id}</div>
-                                <div class="consultation-customer">${consultation.customer || 'Unknown'}</div>
-                                <div class="consultation-meta">
-                                    <span class="meta-item">
-                                        🕒 ${this.formatTime(createdAt)}
-                                    </span>
-                                    <span class="meta-item">
-                                        ⏱️ 대기 ${waitMinutes}분
-                                    </span>
-                                </div>
-                            </div>
-                            <div class="consultation-status">
-                                <span class="status-badge ${isUrgent ? 'urgent' : 'waiting'}">
-                                    ${isUrgent ? '긴급' : '대기중'}
-                                </span>
-                                <button class="action-btn" onclick="monitor.handleConsultation('${consultation.id}')">
-                                    상담 시작
-                                </button>
-                            </div>
-                        </div>
+                        <tr ondblclick="monitor.openChat('${c.id}')">
+                            <td class="team">${c.team}</td>
+                            <td class="manager">${c.manager}</td>
+                            <td class="message" title="${this.escapeHtml(c.last_message)}">${this.escapeHtml(c.last_message)}</td>
+                            <td><span class="wait-time ${waitClass}">${c.wait_minutes}분</span></td>
+                        </tr>
                     `;
                 }).join('');
             }
 
-            updateStats() {
-                const consultationsArray = Array.from(this.consultations.values());
-                
-                this.stats.waiting = consultationsArray.filter(c => c.status === 'waiting').length;
-                this.stats.urgent = consultationsArray.filter(c => c.status === 'urgent' || 
-                    Math.floor((Date.now() - c.createdAt) / 60000) > 15).length;
-                
-                const totalWaitTime = consultationsArray.reduce((sum, c) => 
-                    sum + Math.floor((Date.now() - c.createdAt) / 60000), 0);
-                this.stats.avgWaitTime = consultationsArray.length > 0 ? 
-                    Math.round(totalWaitTime / consultationsArray.length) : 0;
-                
-                this.stats.totalToday = consultationsArray.length + Math.floor(Math.random() * 50);
-                
-                this.updateStatsDisplay();
+            getWaitClass(minutes) {
+                if (minutes >= 11) return 'wait-red';
+                if (minutes >= 7) return 'wait-orange';
+                if (minutes >= 5) return 'wait-yellow';
+                if (minutes >= 3) return 'wait-blue';
+                return 'wait-green';
             }
 
-            updateStatsDisplay() {
-                document.getElementById('waitingCount').textContent = this.stats.waiting;
-                document.getElementById('urgentCount').textContent = this.stats.urgent;
-                document.getElementById('avgWaitTime').textContent = `${this.stats.avgWaitTime}분`;
-                document.getElementById('totalToday').textContent = this.stats.totalToday;
-                
-                // 변화량 표시
-                const waitingChange = document.getElementById('waitingChange');
-                waitingChange.textContent = this.stats.waiting > 0 ? `+${this.stats.waiting}` : '0';
-                waitingChange.className = this.stats.waiting > 5 ? 'stat-change negative' : 'stat-change';
-                
-                document.getElementById('urgentChange').textContent = this.stats.urgent;
+            openChat(chatId) {
+                window.open(`https://desk.channel.io/#/channels/${CHANNEL_ID}/user_chats/${chatId}`, '_blank');
             }
 
-            updateConnectionStatus(connected) {
-                const statusDot = document.getElementById('connectionStatus');
-                const statusText = document.getElementById('connectionText');
+            updateStatus(connected) {
+                const dot = document.getElementById('statusDot');
+                const text = document.getElementById('statusText');
                 
                 if (connected) {
-                    statusDot.className = 'status-dot';
-                    statusText.textContent = '연결됨';
+                    dot.classList.remove('disconnected');
+                    text.textContent = '연결됨';
                 } else {
-                    statusDot.className = 'status-dot disconnected';
-                    statusText.textContent = '연결 끊김';
+                    dot.classList.add('disconnected');
+                    text.textContent = '연결 끊김';
                 }
             }
 
-            setupEventListeners() {
-                // 필터 버튼
-                document.querySelectorAll('.filter-btn').forEach(btn => {
-                    btn.addEventListener('click', (e) => {
-                        document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
-                        e.target.classList.add('active');
-                        this.currentFilter = e.target.dataset.filter;
-                        this.updateDisplay();
-                    });
-                });
+            escapeHtml(text) {
+                const div = document.createElement('div');
+                div.textContent = text || '';
+                return div.innerHTML;
             }
 
-            startPeriodicUpdate() {
-                // 1분마다 데이터 새로고침 (WebSocket 백업)
+            startTimer() {
+                // 1분마다 대기시간 재계산 및 재렌더링
                 setInterval(() => {
-                    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-                        this.loadInitialData();
-                    }
-                    // 대기 시간 실시간 업데이트
-                    this.updateDisplay();
+                    this.consultations.forEach(c => {
+                        const msgTime = new Date(c.last_message_time);
+                        const now = new Date();
+                        c.wait_minutes = Math.floor((now - msgTime) / 60000);
+                    });
+                    this.render();
                 }, 60000);
             }
-
-            loadInitialData() {
-                // WebSocket 연결 후 자동으로 초기 데이터를 받으므로
-                // 연결 실패시에만 REST API 호출
-                if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-                    setTimeout(() => this.loadInitialData(), 2000);
-                }
-            }
-
-            async handleConsultation(consultationId) {
-                console.log('상담 시작:', consultationId);
-                
-                try {
-                    // API 호출로 상담을 답변 완료로 표시
-                    const response = await fetch(`${API_BASE}/api/consultations/${consultationId}/answer`, {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json'
-                        }
-                    });
-                    
-                    if (response.ok) {
-                        // 채널톡으로 이동 (실제 채널톡 URL로 변경 필요)
-                        window.open(`https://desk.channel.io/#/channels/YOUR_CHANNEL_ID/user_chats/${consultationId}`, '_blank');
-                        this.removeConsultation(consultationId);
-                    } else {
-                        console.error('상담 처리 실패');
-                        this.showNotification('오류', '상담 처리에 실패했습니다.');
-                    }
-                } catch (error) {
-                    console.error('API 호출 실패:', error);
-                    this.showNotification('오류', '서버 연결에 실패했습니다.');
-                }
-            }
-
-            showNotification(title, message) {
-                if ('Notification' in window && Notification.permission === 'granted') {
-                    new Notification(title, {
-                        body: message,
-                        icon: '/favicon.ico',
-                        badge: '/favicon.ico'
-                    });
-                }
-            }
-
-            formatTime(date) {
-                return new Date(date).toLocaleTimeString('ko-KR', { 
-                    hour: '2-digit', 
-                    minute: '2-digit' 
-                });
-            }
         }
 
-        // 알림 권한 요청
-        if ('Notification' in window && Notification.permission === 'default') {
-            Notification.requestPermission();
-        }
-
-        // 모니터 인스턴스 생성
-        const monitor = new ConsultationMonitor();
+        const monitor = new Monitor();
     </script>
 </body>
-</html>
+</html>"""
+    return HTMLResponse(content=html_content)
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, workers=2)

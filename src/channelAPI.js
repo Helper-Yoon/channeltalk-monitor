@@ -1,4 +1,4 @@
-// src/channelAPI.js - 15,000개 전체 스캔 버전
+// src/channelAPI.js - 최적화 버전
 import fetch from 'node-fetch';
 
 export class ChannelTalkService {
@@ -13,6 +13,7 @@ export class ChannelTalkService {
     this.apiCallCount = 0; // API 호출 횟수 추적
     this.lastSyncTime = 0; // 마지막 동기화 시간
     this.lastManagerLoad = 0; // 매니저 마지막 로드 시간
+    this.lastFullScan = 0; // 마지막 전체 스캔 시간
     
     // 팀별 담당자 매핑
     this.teamMembers = {
@@ -31,10 +32,8 @@ export class ChannelTalkService {
   }
 
   async makeRequest(endpoint, options = {}) {
-    // Rate limit 방지: API 호출 간 100ms 딜레이
-    if (this.apiCallCount > 0) {
-      await this.delay(100);
-    }
+    // Rate limit 방지: API 호출 간 딜레이
+    await this.delay(300); // 100ms → 300ms로 증가
     
     this.apiCallCount++;
     
@@ -54,9 +53,9 @@ export class ChannelTalkService {
       });
       
       if (response.status === 429) {
-        // Rate limit 도달시 5초 대기 후 재시도
-        console.warn('Rate limit reached, waiting 5 seconds...');
-        await this.delay(5000);
+        // Rate limit 도달시 10초 대기 후 재시도
+        console.warn('Rate limit reached, waiting 10 seconds...');
+        await this.delay(10000);
         return this.makeRequest(endpoint, options);
       }
       
@@ -82,12 +81,9 @@ export class ChannelTalkService {
       
       console.log('Loading ALL managers from Channel Talk...');
       
-      // 모든 매니저를 가져올 때까지 반복
       while (hasMore) {
         try {
           const endpoint = `/managers?limit=500&offset=${offset}`;
-          console.log(`Fetching managers: offset=${offset}`);
-          
           const data = await this.makeRequest(endpoint);
           
           if (data.managers && data.managers.length > 0) {
@@ -96,20 +92,17 @@ export class ChannelTalkService {
                 id: manager.id,
                 name: manager.name || manager.displayName || manager.email || 'Unknown',
                 displayName: manager.displayName,
-                email: manager.email,
-                avatarUrl: manager.avatarUrl
+                email: manager.email
               };
               totalManagers++;
             });
             
-            console.log(`Loaded batch: ${data.managers.length} managers (total: ${totalManagers})`);
+            console.log(`Loaded ${data.managers.length} managers (total: ${totalManagers})`);
             
-            // 500개 미만이면 마지막 페이지
             if (data.managers.length < 500) {
               hasMore = false;
             } else {
               offset += 500;
-              await this.delay(1000); // Rate limit 방지
             }
           } else {
             hasMore = false;
@@ -132,17 +125,14 @@ export class ChannelTalkService {
     
     const fullName = String(name).trim();
     
-    // 정확한 매칭 우선
     for (const [team, members] of Object.entries(this.teamMembers)) {
       if (members.includes(fullName)) {
         return team;
       }
     }
     
-    // 부분 매칭
     for (const [team, members] of Object.entries(this.teamMembers)) {
       for (const member of members) {
-        // 이름이 포함되어 있는지 체크
         if (fullName.includes(member) || member.includes(fullName)) {
           return team;
         }
@@ -173,41 +163,52 @@ export class ChannelTalkService {
         console.log(`Using cached managers (${Object.keys(this.managers).length} managers)`);
       }
       
-      // ⭐️ 모든 열린 상담 가져오기 (페이지네이션)
-      const allUserChats = [];
-      let offset = 0;
-      let hasMore = true;
-      const limit = 500; // 한번에 500개씩
+      // 전체 스캔 여부 결정 (10분마다 전체 스캔)
+      const isFullScan = (now - this.lastFullScan > 600000) || this.lastFullScan === 0;
       
-      console.log('Fetching ALL open chats...');
+      let allUserChats = [];
       
-      while (hasMore) {
-        try {
-          const data = await this.makeRequest(`/user-chats?state=opened&limit=${limit}&offset=${offset}&sortOrder=desc`);
-          const userChats = data.userChats || [];
-          
-          allUserChats.push(...userChats);
-          console.log(`Fetched batch: ${userChats.length} chats (total: ${allUserChats.length})`);
-          
-          if (userChats.length < limit) {
+      if (isFullScan) {
+        // 전체 스캔
+        console.log('🔍 FULL SCAN - Fetching ALL open chats...');
+        this.lastFullScan = now;
+        
+        let offset = 0;
+        let hasMore = true;
+        const limit = 500;
+        
+        while (hasMore) {
+          try {
+            const data = await this.makeRequest(`/user-chats?state=opened&limit=${limit}&offset=${offset}&sortOrder=desc`);
+            const userChats = data.userChats || [];
+            
+            allUserChats.push(...userChats);
+            console.log(`Fetched batch: ${userChats.length} chats (total: ${allUserChats.length})`);
+            
+            if (userChats.length < limit) {
+              hasMore = false;
+            } else {
+              offset += limit;
+            }
+            
+            // 안전장치: 25000개 이상이면 중단
+            if (allUserChats.length > 25000) {
+              console.warn('Safety limit reached: 25000 chats');
+              hasMore = false;
+            }
+          } catch (error) {
+            console.error(`Error fetching chats at offset ${offset}:`, error);
             hasMore = false;
-          } else {
-            offset += limit;
-            await this.delay(500); // Rate limit 방지
           }
-          
-          // 안전장치: 20000개 이상이면 중단
-          if (allUserChats.length > 20000) {
-            console.warn('Safety limit reached: 20000 chats');
-            hasMore = false;
-          }
-        } catch (error) {
-          console.error(`Error fetching chats at offset ${offset}:`, error);
-          hasMore = false;
         }
+      } else {
+        // 빠른 스캔 (최근 500개만)
+        console.log('⚡ QUICK SCAN - Fetching recent 500 chats only...');
+        const data = await this.makeRequest('/user-chats?state=opened&limit=500&sortOrder=desc');
+        allUserChats = data.userChats || [];
       }
       
-      console.log(`✅ Total open chats found: ${allUserChats.length}`);
+      console.log(`✅ Total chats to process: ${allUserChats.length}`);
       
       // 기존 상담 ID 목록 가져오기
       const existingIds = await this.redis.zRange('consultations:waiting', 0, -1);
@@ -222,11 +223,12 @@ export class ChannelTalkService {
         }
       }
       
-      // 미답변 상담 찾기 (배치 처리)
+      // 미답변 상담 찾기 (최적화)
       const unansweredChats = [];
-      const batchSize = 10; // 한번에 10개씩 처리
+      const batchSize = 5; // 10 → 5로 줄임
       let processedCount = 0;
-      let unansweredCount = 0;
+      let newChatsCount = 0;
+      let skippedCount = 0;
       
       console.log('Processing chats for unanswered messages...');
       
@@ -237,31 +239,31 @@ export class ChannelTalkService {
           try {
             processedCount++;
             
-            // 진행 상황 로그 (1000개마다)
-            if (processedCount % 1000 === 0) {
-              console.log(`Progress: ${processedCount}/${allUserChats.length} chats processed, ${unansweredCount} unanswered found`);
+            // 진행 상황 로그 (500개마다)
+            if (processedCount % 500 === 0) {
+              console.log(`Progress: ${processedCount}/${allUserChats.length} (New: ${newChatsCount}, Skipped: ${skippedCount})`);
             }
             
-            // 이미 처리한 채팅은 스킵
+            // 이미 처리한 채팅은 대기시간만 업데이트
             const existingData = await this.redis.hGetAll(`consultation:${chat.id}`);
             if (existingData && Object.keys(existingData).length > 0) {
-              // 대기시간만 업데이트
               const waitTime = this.calculateWaitTime(parseInt(existingData.frontUpdatedAt));
               existingData.waitTime = String(waitTime);
               unansweredChats.push(existingData);
-              unansweredCount++;
-              return;
+              skippedCount++;
+              return; // API 호출 없이 스킵
             }
             
             // 새로운 채팅만 상세 정보 조회
-            const chatDetail = await this.makeRequest(`/user-chats/${chat.id}`);
+            newChatsCount++;
+            
+            // 채팅 상세 정보와 메시지를 한번에 가져오기
+            const [chatDetail, messagesData] = await Promise.all([
+              this.makeRequest(`/user-chats/${chat.id}`),
+              this.makeRequest(`/user-chats/${chat.id}/messages?sortOrder=desc&limit=5`)
+            ]);
+            
             const fullChat = chatDetail.userChat || chat;
-            
-            // 딜레이 추가
-            await this.delay(200);
-            
-            // 마지막 메시지 확인
-            const messagesData = await this.makeRequest(`/user-chats/${chat.id}/messages?sortOrder=desc&limit=5`);
             const messages = messagesData.messages || [];
             
             const lastCustomerMessage = messages.find(m => m.personType === 'user');
@@ -278,10 +280,7 @@ export class ChannelTalkService {
                   counselorName = assignee.name || assignee.displayName || '미배정';
                   teamName = this.findTeamByName(counselorName);
                 } else {
-                  // assigneeId는 있는데 매니저 목록에 없는 경우
-                  console.log(`❌ Manager NOT in cache - assigneeId: ${fullChat.assigneeId}`);
-                  
-                  // 개별적으로 매니저 정보 조회 시도
+                  // 캐시에 없으면 개별 조회
                   try {
                     const managerData = await this.makeRequest(`/managers/${fullChat.assigneeId}`);
                     if (managerData.manager) {
@@ -296,11 +295,8 @@ export class ChannelTalkService {
                         displayName: manager.displayName,
                         email: manager.email
                       };
-                      
-                      console.log(`✅ Manager fetched individually: ${counselorName}`);
                     }
                   } catch (err) {
-                    console.error(`Failed to fetch manager ${fullChat.assigneeId}:`, err.message);
                     counselorName = '확인필요';
                     teamName = '확인필요';
                   }
@@ -331,7 +327,6 @@ export class ChannelTalkService {
               };
               
               unansweredChats.push(consultationData);
-              unansweredCount++;
               
               // Redis에 저장
               const redisData = Object.entries(consultationData)
@@ -347,17 +342,17 @@ export class ChannelTalkService {
             }
           } catch (error) {
             console.error(`Error processing chat ${chat.id}:`, error.message);
-            // 에러가 발생해도 계속 진행
           }
         }));
         
-        // 배치 간 딜레이
+        // 배치 간 딜레이 (Rate limit 방지)
         if (i + batchSize < allUserChats.length) {
-          await this.delay(1000);
+          await this.delay(1500); // 1000ms → 1500ms
         }
       }
       
-      console.log(`=== Sync complete: ${unansweredChats.length} unanswered chats from ${allUserChats.length} total (${this.apiCallCount} API calls) ===`);
+      const scanType = isFullScan ? 'FULL SCAN' : 'QUICK SCAN';
+      console.log(`=== ${scanType} complete: ${unansweredChats.length} unanswered (${newChatsCount} new, ${skippedCount} cached) from ${allUserChats.length} total (${this.apiCallCount} API calls) ===`);
       
       // 정렬: 대기시간 내림차순
       unansweredChats.sort((a, b) => {

@@ -4,7 +4,7 @@ from aiohttp import web
 import redis.asyncio as aioredis
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import logging
 from typing import Dict, List, Optional, Set
 import weakref
@@ -16,6 +16,7 @@ from collections import defaultdict
 REDIS_URL = os.getenv('REDIS_URL', 'redis://red-d2ct46buibrs738rintg:6379')
 WEBHOOK_TOKEN = '80ab2d11835f44b89010c8efa5eec4b4'
 PORT = int(os.getenv('PORT', 10000))
+CHANNELTALK_DESK_URL = 'https://desk.channel.io/#/channels/@ajungdang/user_chats/'
 
 # ===== 로깅 설정 =====
 logging.basicConfig(
@@ -88,7 +89,7 @@ class ChannelTalkMonitor:
                 pass
         
         if self.redis:
-            await self.redis.aclose()  # close() 대신 aclose() 사용
+            await self.redis.aclose()
             
         if self.redis_pool:
             await self.redis_pool.disconnect()
@@ -110,10 +111,8 @@ class ChannelTalkMonitor:
                         self.chat_cache[chat_id] = data
                         valid_count += 1
                     except:
-                        # 손상된 데이터 제거
                         await self.redis.srem('unanswered_chats', chat_id)
                 else:
-                    # 고아 ID 제거
                     await self.redis.srem('unanswered_chats', chat_id)
             
             logger.info(f"📥 초기 로드: {valid_count}개 미답변 상담")
@@ -227,8 +226,8 @@ class ChannelTalkMonitor:
         except Exception as e:
             logger.error(f"❌ 저장 실패 [{chat_id}]: {e}")
     
-    async def remove_chat(self, chat_id: str):
-        """채팅 제거"""
+    async def remove_chat(self, chat_id: str, manager_name: str = None):
+        """채팅 제거 및 답변자 기록"""
         chat_id = str(chat_id)
         
         try:
@@ -245,6 +244,12 @@ class ChannelTalkMonitor:
             await pipe.hincrby('stats:total', 'answered', 1)
             await pipe.hincrby('stats:today', f"answered:{datetime.now().date()}", 1)
             
+            # 답변자 랭킹 업데이트
+            if manager_name:
+                today = datetime.now().strftime('%Y-%m-%d')
+                await pipe.hincrby('ranking:daily', f"{today}:{manager_name}", 1)
+                await pipe.hincrby('ranking:total', manager_name, 1)
+            
             results = await pipe.execute()
             
             # 실제로 제거된 경우만 처리
@@ -253,13 +258,14 @@ class ChannelTalkMonitor:
                 if chat_id in self.chat_cache:
                     del self.chat_cache[chat_id]
                 
-                logger.info(f"✅ 제거: {chat_id}")
+                logger.info(f"✅ 제거: {chat_id} {f'(답변자: {manager_name})' if manager_name else ''}")
                 
                 # WebSocket 브로드캐스트
                 await self.broadcast({
                     'type': 'chat_answered',
                     'chatId': chat_id,
                     'total': len(self.chat_cache),
+                    'manager': manager_name,
                     'timestamp': datetime.now(timezone.utc).isoformat()
                 })
                 
@@ -326,6 +332,38 @@ class ChannelTalkMonitor:
             logger.error(f"❌ 조회 실패: {e}")
             return []
     
+    async def get_rankings(self) -> dict:
+        """답변 랭킹 조회"""
+        try:
+            # 오늘 랭킹
+            today = datetime.now().strftime('%Y-%m-%d')
+            daily_pattern = f"{today}:*"
+            daily_data = {}
+            
+            # 일별 랭킹 조회
+            cursor = '0'
+            while cursor != 0:
+                cursor, keys = await self.redis.hscan('ranking:daily', cursor, match=daily_pattern)
+                for key, value in keys.items():
+                    manager = key.split(':', 1)[1]
+                    daily_data[manager] = int(value)
+            
+            # 전체 랭킹
+            total_data = await self.redis.hgetall('ranking:total')
+            total_ranking = {k: int(v) for k, v in total_data.items()}
+            
+            # 정렬
+            daily_ranking = sorted(daily_data.items(), key=lambda x: x[1], reverse=True)[:10]
+            total_ranking = sorted(total_ranking.items(), key=lambda x: x[1], reverse=True)[:10]
+            
+            return {
+                'daily': daily_ranking,
+                'total': total_ranking
+            }
+        except Exception as e:
+            logger.error(f"랭킹 조회 실패: {e}")
+            return {'daily': [], 'total': []}
+    
     async def handle_webhook(self, request):
         """웹훅 처리 (최적화)"""
         # 토큰 검증
@@ -384,7 +422,9 @@ class ChannelTalkMonitor:
                 
             elif person_type in ['manager', 'bot']:
                 # 답변시 제거
-                await self.remove_chat(str(chat_id))
+                manager_info = refers.get('manager', {})
+                manager_name = manager_info.get('name', 'Bot' if person_type == 'bot' else 'Unknown')
+                await self.remove_chat(str(chat_id), manager_name)
                 
         except Exception as e:
             logger.error(f"메시지 처리 오류: {e}")
@@ -405,6 +445,7 @@ class ChannelTalkMonitor:
     async def get_chats(self, request):
         """API: 채팅 목록"""
         chats = await self.get_all_chats()
+        rankings = await self.get_rankings()
         
         # 통계 수집
         stats = {
@@ -420,6 +461,7 @@ class ChannelTalkMonitor:
         return web.json_response({
             'chats': chats,
             'stats': stats,
+            'rankings': rankings,
             'timestamp': datetime.now(timezone.utc).isoformat(),
             'lastSync': self.last_sync
         })
@@ -428,8 +470,12 @@ class ChannelTalkMonitor:
         """API: 수동 답변 완료 처리"""
         try:
             chat_id = request.match_info.get('chat_id')
+            data = await request.json() if request.body_exists else {}
+            manager_name = data.get('manager', 'Manual')
+            
             if chat_id:
-                await self.remove_chat(chat_id)
+                await self.remove_chat(chat_id, manager_name)
+                logger.info(f"✅ 수동 답변 완료: {chat_id} by {manager_name}")
                 return web.json_response({'status': 'ok', 'chatId': chat_id})
             else:
                 return web.json_response({'status': 'error', 'message': 'No chat_id provided'}, status=400)
@@ -448,9 +494,11 @@ class ChannelTalkMonitor:
         try:
             # 초기 데이터 전송
             chats = await self.get_all_chats()
+            rankings = await self.get_rankings()
             await ws.send_json({
                 'type': 'initial',
                 'chats': chats,
+                'rankings': rankings,
                 'total': len(chats)
             })
             
@@ -463,9 +511,11 @@ class ChannelTalkMonitor:
                             await ws.send_json({'type': 'pong'})
                         elif data.get('type') == 'refresh':
                             chats = await self.get_all_chats()
+                            rankings = await self.get_rankings()
                             await ws.send_json({
                                 'type': 'refresh',
-                                'chats': chats
+                                'chats': chats,
+                                'rankings': rankings
                             })
                     except:
                         pass
@@ -525,32 +575,43 @@ class ChannelTalkMonitor:
         """대시보드 HTML 제공"""
         return web.Response(text=DASHBOARD_HTML, content_type='text/html')
 
-# ===== 최적화된 대시보드 HTML =====
+# ===== 아정당 브랜드 최적화 대시보드 =====
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>아정당 채널톡 실시간 모니터</title>
+    <title>아정당 고객센터 | 실시간 상담 모니터</title>
     <style>
         :root {
-            --bg-primary: #0a0e1a;
-            --bg-secondary: #151922;
-            --bg-card: #1e2330;
-            --bg-hover: #252b3b;
-            --text-primary: #ffffff;
-            --text-secondary: #94a3b8;
-            --text-dim: #64748b;
-            --border: #2d3548;
-            --channeltalk: #5c6ac4;
-            --critical: #ef4444;
-            --warning: #f97316;
-            --caution: #eab308;
-            --normal: #3b82f6;
-            --new: #10b981;
-            --success: #22c55e;
-            --glass: rgba(255, 255, 255, 0.05);
+            /* 아정당 브랜드 컬러 */
+            --ajd-blue: #0066CC;
+            --ajd-blue-dark: #0052A3;
+            --ajd-blue-light: #4D94FF;
+            --ajd-sky: #E6F2FF;
+            
+            /* 배경색 */
+            --bg-primary: #FFFFFF;
+            --bg-secondary: #F8FAFB;
+            --bg-card: #FFFFFF;
+            
+            /* 텍스트 */
+            --text-primary: #1A1A1A;
+            --text-secondary: #6B7280;
+            --text-light: #9CA3AF;
+            
+            /* 상태 색상 */
+            --critical: #DC2626;
+            --warning: #F59E0B;
+            --caution: #EAB308;
+            --normal: #0066CC;
+            --new: #10B981;
+            
+            /* 기타 */
+            --border: #E5E7EB;
+            --shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+            --shadow-hover: 0 4px 16px rgba(0, 102, 204, 0.15);
         }
 
         * { 
@@ -561,269 +622,233 @@ DASHBOARD_HTML = """
 
         body {
             font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-            background: linear-gradient(135deg, var(--bg-primary) 0%, #0f172a 100%);
+            background: var(--bg-secondary);
             color: var(--text-primary);
             min-height: 100vh;
-            position: relative;
-            overflow-x: hidden;
-        }
-
-        /* 배경 애니메이션 */
-        body::before {
-            content: '';
-            position: fixed;
-            top: -50%;
-            left: -50%;
-            width: 200%;
-            height: 200%;
-            background: radial-gradient(circle at 20% 80%, rgba(92, 106, 196, 0.1) 0%, transparent 50%),
-                        radial-gradient(circle at 80% 20%, rgba(239, 68, 68, 0.05) 0%, transparent 50%);
-            animation: drift 20s ease-in-out infinite;
-            z-index: -1;
-        }
-
-        @keyframes drift {
-            0%, 100% { transform: rotate(0deg); }
-            50% { transform: rotate(180deg); }
+            line-height: 1.6;
         }
 
         .container {
             max-width: 1600px;
             margin: 0 auto;
-            padding: 24px;
+            padding: 20px;
         }
 
         /* 헤더 */
         .header {
-            background: var(--glass);
-            backdrop-filter: blur(20px);
-            border: 1px solid var(--border);
-            border-radius: 20px;
-            padding: 32px;
-            margin-bottom: 32px;
-            position: relative;
-            overflow: hidden;
+            background: var(--bg-primary);
+            border-radius: 12px;
+            padding: 24px;
+            margin-bottom: 24px;
+            box-shadow: var(--shadow);
         }
 
-        .header::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            height: 2px;
-            background: linear-gradient(90deg, var(--channeltalk), var(--critical), var(--warning), var(--success));
-            animation: shimmer 3s linear infinite;
-        }
-
-        @keyframes shimmer {
-            0% { transform: translateX(-100%); }
-            100% { transform: translateX(100%); }
-        }
-
-        .header-content {
+        .header-top {
             display: flex;
             justify-content: space-between;
             align-items: center;
+            margin-bottom: 20px;
             flex-wrap: wrap;
-            gap: 20px;
+            gap: 16px;
+        }
+
+        .logo-section {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .logo {
+            width: 40px;
+            height: 40px;
+            background: var(--ajd-blue);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: 700;
+            font-size: 18px;
         }
 
         .title {
-            font-size: 32px;
-            font-weight: 800;
-            background: linear-gradient(135deg, var(--channeltalk) 0%, #818cf8 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
+            font-size: 24px;
+            font-weight: 700;
+            color: var(--text-primary);
+        }
+
+        .header-controls {
             display: flex;
-            align-items: center;
             gap: 12px;
-        }
-
-        .connection-status {
-            display: flex;
             align-items: center;
-            gap: 8px;
+        }
+
+        .current-time {
             padding: 8px 16px;
-            background: var(--glass);
-            border: 1px solid var(--border);
-            border-radius: 12px;
+            background: var(--bg-secondary);
+            border-radius: 8px;
             font-size: 14px;
+            font-weight: 500;
+            color: var(--text-secondary);
+            font-variant-numeric: tabular-nums;
         }
 
-        .status-dot {
-            width: 8px;
-            height: 8px;
-            border-radius: 50%;
-            animation: pulse 2s infinite;
+        .view-toggle {
+            display: flex;
+            background: var(--bg-secondary);
+            border-radius: 8px;
+            padding: 4px;
         }
 
-        .status-dot.connected {
-            background: var(--success);
+        .view-btn {
+            padding: 6px 12px;
+            border: none;
+            background: transparent;
+            color: var(--text-secondary);
+            cursor: pointer;
+            border-radius: 6px;
+            font-size: 14px;
+            font-weight: 500;
+            transition: all 0.2s;
         }
 
-        .status-dot.disconnected {
-            background: var(--critical);
-            animation: none;
-        }
-
-        @keyframes pulse {
-            0%, 100% { opacity: 1; transform: scale(1); }
-            50% { opacity: 0.6; transform: scale(1.2); }
+        .view-btn.active {
+            background: var(--ajd-blue);
+            color: white;
         }
 
         /* 통계 카드 */
-        .stats {
+        .stats-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-            gap: 16px;
-            margin-top: 24px;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 12px;
         }
 
         .stat-card {
-            background: var(--glass);
-            backdrop-filter: blur(10px);
-            border: 1px solid var(--border);
-            border-radius: 16px;
-            padding: 20px;
+            background: var(--bg-secondary);
+            border-radius: 8px;
+            padding: 16px;
             text-align: center;
-            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-            position: relative;
-            overflow: hidden;
-        }
-
-        .stat-card::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: linear-gradient(135deg, transparent, rgba(255,255,255,0.02));
-            opacity: 0;
-            transition: opacity 0.3s;
-        }
-
-        .stat-card:hover::before {
-            opacity: 1;
+            border: 1px solid var(--border);
+            transition: transform 0.2s;
         }
 
         .stat-card:hover {
-            transform: translateY(-4px);
-            border-color: var(--channeltalk);
+            transform: translateY(-2px);
         }
 
         .stat-value {
-            font-size: 36px;
-            font-weight: 800;
+            font-size: 28px;
+            font-weight: 700;
             margin-bottom: 4px;
             font-variant-numeric: tabular-nums;
         }
 
         .stat-label {
-            font-size: 13px;
+            font-size: 12px;
             color: var(--text-secondary);
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
+            font-weight: 500;
         }
 
-        /* 필터 & 액션 바 */
-        .action-bar {
+        /* 메인 컨텐츠 영역 */
+        .main-content {
+            display: grid;
+            grid-template-columns: 1fr 320px;
+            gap: 24px;
+            margin-bottom: 24px;
+        }
+
+        @media (max-width: 1200px) {
+            .main-content {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        /* 상담 리스트 섹션 */
+        .chats-section {
+            background: var(--bg-primary);
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: var(--shadow);
+        }
+
+        .section-header {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 24px;
-            gap: 16px;
-            flex-wrap: wrap;
+            margin-bottom: 16px;
+            padding-bottom: 12px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .section-title {
+            font-size: 16px;
+            font-weight: 600;
+            color: var(--text-primary);
         }
 
         .filter-group {
             display: flex;
             gap: 8px;
-            flex-wrap: wrap;
         }
 
         .filter-btn {
-            padding: 8px 16px;
-            background: var(--glass);
+            padding: 6px 12px;
+            background: transparent;
             border: 1px solid var(--border);
             color: var(--text-secondary);
-            border-radius: 10px;
+            border-radius: 6px;
             cursor: pointer;
-            font-size: 14px;
-            font-weight: 600;
+            font-size: 13px;
+            font-weight: 500;
             transition: all 0.2s;
         }
 
         .filter-btn:hover {
-            background: var(--bg-hover);
-            color: var(--text-primary);
+            border-color: var(--ajd-blue);
+            color: var(--ajd-blue);
         }
 
         .filter-btn.active {
-            background: var(--channeltalk);
+            background: var(--ajd-blue);
             color: white;
-            border-color: var(--channeltalk);
+            border-color: var(--ajd-blue);
         }
 
-        .refresh-btn {
-            padding: 10px 20px;
-            background: linear-gradient(135deg, var(--channeltalk), #818cf8);
-            border: none;
-            color: white;
-            border-radius: 12px;
-            cursor: pointer;
-            font-size: 14px;
-            font-weight: 600;
-            transition: all 0.3s;
+        /* 채팅 그리드/리스트 */
+        .chat-container {
+            max-height: calc(100vh - 400px);
+            overflow-y: auto;
+        }
+
+        .chat-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+            gap: 16px;
+        }
+
+        .chat-list {
             display: flex;
-            align-items: center;
+            flex-direction: column;
             gap: 8px;
         }
 
-        .refresh-btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 10px 20px rgba(92, 106, 196, 0.3);
-        }
-
-        .refresh-btn:active {
-            transform: translateY(0);
-        }
-
-        /* 채팅 그리드 */
-        .chat-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(400px, 1fr));
-            gap: 20px;
-            animation: fadeIn 0.5s ease-out;
-        }
-
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(20px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-
+        /* 채팅 카드 */
         .chat-card {
-            background: var(--glass);
-            backdrop-filter: blur(10px);
+            background: var(--bg-secondary);
             border: 1px solid var(--border);
-            border-radius: 16px;
-            padding: 24px;
+            border-radius: 8px;
+            padding: 16px;
+            cursor: pointer;
+            transition: all 0.2s;
             position: relative;
-            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-            overflow: hidden;
-            animation: slideIn 0.4s ease-out;
+            user-select: none;
         }
 
-        @keyframes slideIn {
-            from { 
-                opacity: 0; 
-                transform: translateX(-20px);
-            }
-            to { 
-                opacity: 1; 
-                transform: translateX(0);
-            }
+        .chat-card:hover {
+            border-color: var(--ajd-blue);
+            box-shadow: var(--shadow-hover);
+            transform: translateY(-2px);
         }
 
         .chat-card::before {
@@ -832,274 +857,251 @@ DASHBOARD_HTML = """
             left: 0;
             top: 0;
             bottom: 0;
-            width: 4px;
-            transition: width 0.3s;
+            width: 3px;
+            border-radius: 8px 0 0 8px;
         }
 
-        .chat-card:hover::before {
-            width: 6px;
+        .chat-card.critical::before { background: var(--critical); }
+        .chat-card.warning::before { background: var(--warning); }
+        .chat-card.caution::before { background: var(--caution); }
+        .chat-card.normal::before { background: var(--normal); }
+        .chat-card.new::before { background: var(--new); }
+
+        /* 리스트 뷰 스타일 */
+        .chat-list .chat-card {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 12px 16px;
         }
 
-        .chat-card.critical::before { background: linear-gradient(180deg, var(--critical), #dc2626); }
-        .chat-card.warning::before { background: linear-gradient(180deg, var(--warning), #ea580c); }
-        .chat-card.caution::before { background: linear-gradient(180deg, var(--caution), #d97706); }
-        .chat-card.normal::before { background: linear-gradient(180deg, var(--normal), #2563eb); }
-        .chat-card.new::before { background: linear-gradient(180deg, var(--new), #059669); }
-
-        .chat-card:hover {
-            transform: translateY(-4px) scale(1.02);
-            box-shadow: 0 20px 40px rgba(0,0,0,0.3);
-            border-color: var(--channeltalk);
+        .chat-list .customer-name {
+            font-weight: 600;
+            min-width: 100px;
         }
 
-        .chat-header {
+        .chat-list .message-preview {
+            flex: 1;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .chat-list .wait-time {
+            font-weight: 600;
+            min-width: 60px;
+            text-align: right;
+        }
+
+        /* 그리드 뷰 스타일 */
+        .chat-grid .customer-name {
+            font-size: 15px;
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 8px;
+        }
+
+        .chat-grid .message-preview {
+            color: var(--text-secondary);
+            font-size: 13px;
+            line-height: 1.4;
+            margin-bottom: 12px;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }
+
+        .chat-grid .chat-footer {
             display: flex;
             justify-content: space-between;
-            align-items: flex-start;
-            margin-bottom: 16px;
-        }
-
-        .customer-info {
-            flex: 1;
-        }
-
-        .customer-name {
-            font-size: 18px;
-            font-weight: 700;
-            margin-bottom: 6px;
-            color: var(--text-primary);
-        }
-
-        .chat-meta {
-            display: flex;
-            gap: 12px;
-            flex-wrap: wrap;
-        }
-
-        .wait-badge {
-            display: inline-flex;
             align-items: center;
-            gap: 4px;
-            padding: 6px 12px;
-            border-radius: 8px;
+        }
+
+        .wait-time {
             font-size: 13px;
             font-weight: 600;
-            animation: pulse 2s infinite;
-        }
-
-        .badge-critical { 
-            background: linear-gradient(135deg, var(--critical), #dc2626); 
-            color: white;
-        }
-        .badge-warning { 
-            background: linear-gradient(135deg, var(--warning), #ea580c); 
-            color: white;
-        }
-        .badge-caution { 
-            background: linear-gradient(135deg, var(--caution), #d97706); 
-            color: white;
-        }
-        .badge-normal { 
-            background: linear-gradient(135deg, var(--normal), #2563eb); 
-            color: white;
-        }
-        .badge-new { 
-            background: linear-gradient(135deg, var(--new), #059669); 
-            color: white;
-        }
-
-        .message-preview {
             color: var(--text-secondary);
-            font-size: 14px;
-            line-height: 1.5;
+        }
+
+        .wait-time.critical { color: var(--critical); }
+        .wait-time.warning { color: var(--warning); }
+        .wait-time.caution { color: var(--caution); }
+        .wait-time.normal { color: var(--normal); }
+        .wait-time.new { color: var(--new); }
+
+        /* 랭킹 섹션 */
+        .ranking-section {
+            background: var(--bg-primary);
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: var(--shadow);
+            height: fit-content;
+        }
+
+        .ranking-tabs {
+            display: flex;
+            gap: 8px;
             margin-bottom: 16px;
-            max-height: 60px;
-            overflow: hidden;
-            display: -webkit-box;
-            -webkit-line-clamp: 3;
-            -webkit-box-orient: vertical;
         }
 
-        .chat-footer {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding-top: 16px;
-            border-top: 1px solid var(--border);
-        }
-
-        .chat-tags {
-            display: flex;
-            gap: 6px;
-            flex-wrap: wrap;
+        .ranking-tab {
             flex: 1;
-        }
-
-        .tag {
-            padding: 4px 8px;
-            background: var(--glass);
+            padding: 8px;
+            background: var(--bg-secondary);
             border: 1px solid var(--border);
             border-radius: 6px;
-            font-size: 12px;
-            color: var(--text-secondary);
-        }
-
-        .action-btn {
-            padding: 8px 16px;
-            background: var(--glass);
-            border: 1px solid var(--channeltalk);
-            color: var(--channeltalk);
-            border-radius: 8px;
             cursor: pointer;
+            text-align: center;
             font-size: 13px;
-            font-weight: 600;
+            font-weight: 500;
+            color: var(--text-secondary);
             transition: all 0.2s;
         }
 
-        .action-btn:hover {
-            background: var(--channeltalk);
+        .ranking-tab.active {
+            background: var(--ajd-blue);
             color: white;
-            transform: translateY(-2px);
+            border-color: var(--ajd-blue);
+        }
+
+        .ranking-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .ranking-item {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 12px;
+            background: var(--bg-secondary);
+            border-radius: 8px;
+            transition: transform 0.2s;
+        }
+
+        .ranking-item:hover {
+            transform: translateX(4px);
+        }
+
+        .ranking-position {
+            width: 24px;
+            height: 24px;
+            background: var(--ajd-blue);
+            color: white;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 12px;
+            font-weight: 700;
+        }
+
+        .ranking-position.gold { background: #FFD700; color: #000; }
+        .ranking-position.silver { background: #C0C0C0; color: #000; }
+        .ranking-position.bronze { background: #CD7F32; color: #FFF; }
+
+        .ranking-name {
+            flex: 1;
+            font-weight: 500;
+            color: var(--text-primary);
+        }
+
+        .ranking-count {
+            font-weight: 700;
+            color: var(--ajd-blue);
         }
 
         /* 빈 상태 */
         .empty-state {
             text-align: center;
-            padding: 120px 20px;
+            padding: 60px 20px;
             color: var(--text-secondary);
-            animation: fadeIn 0.5s ease-out;
         }
 
         .empty-icon {
-            font-size: 80px;
-            margin-bottom: 24px;
-            animation: float 3s ease-in-out infinite;
-        }
-
-        @keyframes float {
-            0%, 100% { transform: translateY(0); }
-            50% { transform: translateY(-10px); }
+            font-size: 48px;
+            margin-bottom: 16px;
         }
 
         .empty-title {
-            font-size: 24px;
-            font-weight: 700;
+            font-size: 18px;
+            font-weight: 600;
             margin-bottom: 8px;
             color: var(--text-primary);
         }
 
         .empty-desc {
-            font-size: 16px;
-            color: var(--text-dim);
-        }
-
-        /* 알림 */
-        .notification {
-            position: fixed;
-            top: 24px;
-            right: 24px;
-            padding: 16px 20px;
-            background: var(--glass);
-            backdrop-filter: blur(20px);
-            border: 1px solid var(--border);
-            border-radius: 12px;
-            color: var(--text-primary);
             font-size: 14px;
-            font-weight: 600;
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            transform: translateX(400px);
-            transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-            z-index: 1000;
-            box-shadow: 0 20px 40px rgba(0,0,0,0.3);
+            color: var(--text-light);
         }
 
-        .notification.show {
-            transform: translateX(0);
-        }
-
-        .notification.success {
-            border-color: var(--success);
-            background: linear-gradient(135deg, rgba(34, 197, 94, 0.1), rgba(16, 185, 129, 0.1));
-        }
-
-        .notification.error {
-            border-color: var(--critical);
-            background: linear-gradient(135deg, rgba(239, 68, 68, 0.1), rgba(220, 38, 38, 0.1));
-        }
-
-        /* 반응형 */
-        @media (max-width: 768px) {
-            .container {
-                padding: 16px;
-            }
-            
-            .title {
-                font-size: 24px;
-            }
-            
-            .chat-grid {
-                grid-template-columns: 1fr;
-            }
-            
-            .stats {
-                grid-template-columns: repeat(3, 1fr);
-            }
-        }
-
-        /* 로딩 애니메이션 */
-        .loading {
-            display: inline-block;
-            width: 20px;
-            height: 20px;
-            border: 3px solid var(--border);
-            border-radius: 50%;
-            border-top-color: var(--channeltalk);
-            animation: spin 1s linear infinite;
-        }
-
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
-
-        /* 스크롤바 스타일 */
+        /* 스크롤바 */
         ::-webkit-scrollbar {
-            width: 8px;
-            height: 8px;
+            width: 6px;
+            height: 6px;
         }
 
         ::-webkit-scrollbar-track {
-            background: var(--bg-primary);
+            background: var(--bg-secondary);
         }
 
         ::-webkit-scrollbar-thumb {
             background: var(--border);
-            border-radius: 4px;
+            border-radius: 3px;
         }
 
         ::-webkit-scrollbar-thumb:hover {
-            background: var(--channeltalk);
+            background: var(--ajd-blue);
+        }
+
+        /* 토스트 알림 */
+        .toast {
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            padding: 12px 20px;
+            background: var(--ajd-blue);
+            color: white;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 500;
+            box-shadow: 0 4px 12px rgba(0, 102, 204, 0.3);
+            transform: translateY(100px);
+            opacity: 0;
+            transition: all 0.3s;
+            z-index: 1000;
+        }
+
+        .toast.show {
+            transform: translateY(0);
+            opacity: 1;
         }
     </style>
 </head>
 <body>
     <div class="container">
+        <!-- 헤더 -->
         <div class="header">
-            <div class="header-content">
-                <h1 class="title">
-                    <span>⚡</span>
-                    아정당 채널톡 실시간 모니터
-                </h1>
-                <div class="connection-status">
-                    <div class="status-dot" id="statusDot"></div>
-                    <span id="statusText">연결 중...</span>
+            <div class="header-top">
+                <div class="logo-section">
+                    <div class="logo">아</div>
+                    <h1 class="title">아정당 고객센터 모니터</h1>
+                </div>
+                <div class="header-controls">
+                    <div class="current-time" id="currentTime">-</div>
+                    <div class="view-toggle">
+                        <button class="view-btn active" data-view="grid">카드</button>
+                        <button class="view-btn" data-view="list">리스트</button>
+                    </div>
                 </div>
             </div>
             
-            <div class="stats" id="statsContainer">
+            <!-- 통계 -->
+            <div class="stats-grid">
                 <div class="stat-card">
-                    <div class="stat-value" id="totalCount">0</div>
+                    <div class="stat-value" style="color: var(--ajd-blue)" id="totalCount">0</div>
                     <div class="stat-label">전체 대기</div>
                 </div>
                 <div class="stat-card">
@@ -1125,39 +1127,56 @@ DASHBOARD_HTML = """
             </div>
         </div>
 
-        <div class="action-bar">
-            <div class="filter-group">
-                <button class="filter-btn active" data-filter="all">전체</button>
-                <button class="filter-btn" data-filter="critical">긴급</button>
-                <button class="filter-btn" data-filter="warning">경고</button>
-                <button class="filter-btn" data-filter="caution">주의</button>
-                <button class="filter-btn" data-filter="normal">일반</button>
-                <button class="filter-btn" data-filter="new">신규</button>
+        <!-- 메인 컨텐츠 -->
+        <div class="main-content">
+            <!-- 상담 리스트 -->
+            <div class="chats-section">
+                <div class="section-header">
+                    <h2 class="section-title">미답변 상담</h2>
+                    <div class="filter-group">
+                        <button class="filter-btn active" data-filter="all">전체</button>
+                        <button class="filter-btn" data-filter="critical">긴급</button>
+                        <button class="filter-btn" data-filter="warning">경고</button>
+                        <button class="filter-btn" data-filter="caution">주의</button>
+                    </div>
+                </div>
+                <div class="chat-container">
+                    <div class="chat-grid" id="chatContainer">
+                        <!-- 채팅 카드 동적 생성 -->
+                    </div>
+                </div>
             </div>
-            <button class="refresh-btn" onclick="refreshData()">
-                <span>🔄</span> 새로고침
-            </button>
-        </div>
 
-        <div class="chat-grid" id="chatGrid">
-            <!-- 채팅 카드 동적 생성 -->
+            <!-- 랭킹 -->
+            <div class="ranking-section">
+                <div class="section-header">
+                    <h2 class="section-title">답변 랭킹</h2>
+                </div>
+                <div class="ranking-tabs">
+                    <button class="ranking-tab active" data-ranking="daily">오늘</button>
+                    <button class="ranking-tab" data-ranking="total">전체</button>
+                </div>
+                <div class="ranking-list" id="rankingList">
+                    <!-- 랭킹 동적 생성 -->
+                </div>
+            </div>
         </div>
     </div>
 
-    <div class="notification" id="notification"></div>
+    <div class="toast" id="toast"></div>
 
     <script>
+        const CHANNELTALK_URL = 'https://desk.channel.io/#/channels/@ajungdang/user_chats/';
+        
         let ws = null;
         let chats = [];
+        let rankings = { daily: [], total: [] };
         let currentFilter = 'all';
+        let currentView = 'grid';
+        let currentRanking = 'daily';
         let reconnectAttempts = 0;
-        const MAX_RECONNECT_ATTEMPTS = 5;
-        const RECONNECT_DELAY = 3000;
-        let soundEnabled = true;
 
-        // 알림음 초기화
-        const notificationSound = new Audio('data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhBTGH0fPTgjMGHm7A7+OZURE');
-
+        // 우선순위 계산
         function getPriority(minutes) {
             if (minutes >= 11) return 'critical';
             if (minutes >= 8) return 'warning';
@@ -1166,44 +1185,41 @@ DASHBOARD_HTML = """
             return 'new';
         }
 
+        // 대기시간 포맷
         function formatWaitTime(minutes) {
-            if (minutes < 1) return '방금 전';
-            if (minutes < 60) return `${Math.floor(minutes)}분 대기`;
+            if (minutes < 1) return '방금';
+            if (minutes < 60) return `${Math.floor(minutes)}분`;
             const hours = Math.floor(minutes / 60);
             const mins = minutes % 60;
-            return `${hours}시간 ${mins}분 대기`;
+            return `${hours}시간 ${mins}분`;
         }
 
-        function showNotification(message, type = 'info') {
-            const notification = document.getElementById('notification');
-            notification.textContent = message;
-            notification.className = `notification ${type} show`;
-            
-            if (type === 'success' && soundEnabled) {
-                notificationSound.play().catch(() => {});
-            }
-            
-            setTimeout(() => {
-                notification.classList.remove('show');
-            }, 3000);
+        // 토스트 알림
+        function showToast(message) {
+            const toast = document.getElementById('toast');
+            toast.textContent = message;
+            toast.classList.add('show');
+            setTimeout(() => toast.classList.remove('show'), 3000);
         }
 
-        function updateConnectionStatus(connected) {
-            const dot = document.getElementById('statusDot');
-            const text = document.getElementById('statusText');
-            
-            if (connected) {
-                dot.className = 'status-dot connected';
-                text.textContent = '실시간 연결됨';
-                reconnectAttempts = 0;
-            } else {
-                dot.className = 'status-dot disconnected';
-                text.textContent = '연결 끊김';
-            }
+        // 시계 업데이트
+        function updateClock() {
+            const now = new Date();
+            const timeStr = now.toLocaleString('ko-KR', {
+                month: 'short',
+                day: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+                hour12: false
+            });
+            document.getElementById('currentTime').textContent = timeStr;
         }
 
+        // 채팅 렌더링
         function renderChats() {
-            const grid = document.getElementById('chatGrid');
+            const container = document.getElementById('chatContainer');
+            container.className = currentView === 'grid' ? 'chat-grid' : 'chat-list';
             
             // 필터링
             let filteredChats = chats;
@@ -1214,52 +1230,45 @@ DASHBOARD_HTML = """
             }
             
             if (filteredChats.length === 0) {
-                grid.innerHTML = `
+                container.innerHTML = `
                     <div class="empty-state">
                         <div class="empty-icon">✨</div>
-                        <h2 class="empty-title">대기 중인 상담이 없습니다</h2>
-                        <p class="empty-desc">
-                            ${currentFilter !== 'all' ? '선택한 필터에 해당하는' : '현재'} 미답변 상담이 없습니다
-                        </p>
+                        <h3 class="empty-title">대기 중인 상담이 없습니다</h3>
+                        <p class="empty-desc">모든 상담이 처리되었습니다</p>
                     </div>
                 `;
             } else {
-                grid.innerHTML = filteredChats.map(chat => {
-                    const priority = getPriority(chat.waitMinutes);
-                    const tags = chat.tags || [];
-                    
-                    return `
-                        <div class="chat-card ${priority}" data-id="${chat.id}">
-                            <div class="chat-header">
-                                <div class="customer-info">
-                                    <div class="customer-name">${chat.customerName || '익명'}</div>
-                                    <div class="chat-meta">
-                                        <div class="wait-badge badge-${priority}">
-                                            ⏱ ${formatWaitTime(chat.waitMinutes)}
-                                        </div>
-                                        ${chat.channel ? `<span class="tag">${chat.channel}</span>` : ''}
-                                    </div>
+                if (currentView === 'grid') {
+                    container.innerHTML = filteredChats.map(chat => {
+                        const priority = getPriority(chat.waitMinutes);
+                        return `
+                            <div class="chat-card ${priority}" ondblclick="openChat('${chat.id}')">
+                                <div class="customer-name">${chat.customerName || '익명'}</div>
+                                <div class="message-preview">${chat.lastMessage || '(메시지 없음)'}</div>
+                                <div class="chat-footer">
+                                    <span class="wait-time ${priority}">${formatWaitTime(chat.waitMinutes)}</span>
                                 </div>
                             </div>
-                            <div class="message-preview">
-                                ${chat.lastMessage || '(메시지 없음)'}
+                        `;
+                    }).join('');
+                } else {
+                    container.innerHTML = filteredChats.map(chat => {
+                        const priority = getPriority(chat.waitMinutes);
+                        return `
+                            <div class="chat-card ${priority}" ondblclick="openChat('${chat.id}')">
+                                <div class="customer-name">${chat.customerName || '익명'}</div>
+                                <div class="message-preview">${chat.lastMessage || '(메시지 없음)'}</div>
+                                <div class="wait-time ${priority}">${formatWaitTime(chat.waitMinutes)}</div>
                             </div>
-                            <div class="chat-footer">
-                                <div class="chat-tags">
-                                    ${tags.map(tag => `<span class="tag">#${tag}</span>`).join('')}
-                                </div>
-                                <button class="action-btn" onclick="markAnswered('${chat.id}')">
-                                    답변 완료
-                                </button>
-                            </div>
-                        </div>
-                    `;
-                }).join('');
+                        `;
+                    }).join('');
+                }
             }
             
             updateStats();
         }
 
+        // 통계 업데이트
         function updateStats() {
             document.getElementById('totalCount').textContent = chats.length;
             document.getElementById('criticalCount').textContent = 
@@ -1274,6 +1283,42 @@ DASHBOARD_HTML = """
                 chats.filter(c => c.waitMinutes < 2).length;
         }
 
+        // 랭킹 렌더링
+        function renderRankings() {
+            const list = document.getElementById('rankingList');
+            const data = rankings[currentRanking] || [];
+            
+            if (data.length === 0) {
+                list.innerHTML = `
+                    <div class="empty-state">
+                        <p class="empty-desc">아직 데이터가 없습니다</p>
+                    </div>
+                `;
+            } else {
+                list.innerHTML = data.slice(0, 10).map((item, index) => {
+                    const [name, count] = item;
+                    let posClass = '';
+                    if (index === 0) posClass = 'gold';
+                    else if (index === 1) posClass = 'silver';
+                    else if (index === 2) posClass = 'bronze';
+                    
+                    return `
+                        <div class="ranking-item">
+                            <div class="ranking-position ${posClass}">${index + 1}</div>
+                            <div class="ranking-name">${name}</div>
+                            <div class="ranking-count">${count}건</div>
+                        </div>
+                    `;
+                }).join('');
+            }
+        }
+
+        // 채널톡 열기
+        function openChat(chatId) {
+            window.open(CHANNELTALK_URL + chatId, '_blank');
+        }
+
+        // WebSocket 연결
         function connectWebSocket() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             const wsUrl = `${protocol}//${window.location.host}/ws`;
@@ -1282,8 +1327,7 @@ DASHBOARD_HTML = """
             
             ws.onopen = () => {
                 console.log('✅ WebSocket 연결됨');
-                updateConnectionStatus(true);
-                showNotification('실시간 연결 성공', 'success');
+                reconnectAttempts = 0;
             };
             
             ws.onmessage = (event) => {
@@ -1291,124 +1335,96 @@ DASHBOARD_HTML = """
                 
                 if (data.type === 'initial') {
                     chats = data.chats || [];
+                    rankings = data.rankings || { daily: [], total: [] };
                     renderChats();
+                    renderRankings();
                 } else if (data.type === 'new_chat') {
-                    // 중복 체크
                     if (!chats.find(c => c.id === data.chat.id)) {
                         chats.push(data.chat);
                         chats.sort((a, b) => b.waitMinutes - a.waitMinutes);
                         renderChats();
-                        showNotification(`새 상담: ${data.chat.customerName}`, 'success');
+                        showToast(`새 상담: ${data.chat.customerName}`);
                     }
                 } else if (data.type === 'chat_answered') {
                     chats = chats.filter(c => c.id !== data.chatId);
                     renderChats();
+                    if (data.manager) {
+                        // 랭킹 업데이트 필요
+                        fetchData();
+                    }
                 } else if (data.type === 'refresh') {
                     chats = data.chats || [];
+                    rankings = data.rankings || { daily: [], total: [] };
                     renderChats();
+                    renderRankings();
                 }
             };
             
             ws.onerror = (error) => {
                 console.error('WebSocket 오류:', error);
-                updateConnectionStatus(false);
             };
             
             ws.onclose = () => {
-                updateConnectionStatus(false);
-                
-                if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+                if (reconnectAttempts < 5) {
                     reconnectAttempts++;
-                    console.log(`재연결 시도 ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}`);
-                    setTimeout(connectWebSocket, RECONNECT_DELAY * reconnectAttempts);
-                } else {
-                    showNotification('연결 실패. 페이지를 새로고침하세요.', 'error');
+                    setTimeout(connectWebSocket, 3000 * reconnectAttempts);
                 }
             };
-            
-            // 주기적 ping
-            setInterval(() => {
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                    ws.send(JSON.stringify({ type: 'ping' }));
-                }
-            }, 30000);
         }
 
+        // 데이터 가져오기
         async function fetchData() {
             try {
                 const response = await fetch('/api/chats');
                 const data = await response.json();
                 chats = data.chats || [];
+                rankings = data.rankings || { daily: [], total: [] };
                 renderChats();
+                renderRankings();
             } catch (error) {
                 console.error('데이터 로드 실패:', error);
-                showNotification('데이터 로드 실패', 'error');
             }
         }
 
-        async function refreshData() {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'refresh' }));
-                showNotification('새로고침 중...', 'info');
-            } else {
-                await fetchData();
-            }
-        }
-
-        async function markAnswered(chatId) {
-            try {
-                await fetch(`/api/chats/${chatId}/answer`, { method: 'POST' });
-                chats = chats.filter(c => c.id !== chatId);
-                renderChats();
-                showNotification('답변 완료 처리됨', 'success');
-            } catch (error) {
-                console.error('처리 실패:', error);
-                showNotification('처리 실패', 'error');
-            }
-        }
-
-        // 필터 이벤트
+        // 이벤트 리스너
         document.addEventListener('DOMContentLoaded', () => {
+            // 뷰 전환
+            document.querySelectorAll('.view-btn').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    document.querySelectorAll('.view-btn').forEach(b => b.classList.remove('active'));
+                    e.target.classList.add('active');
+                    currentView = e.target.dataset.view;
+                    renderChats();
+                });
+            });
+
+            // 필터
             document.querySelectorAll('.filter-btn').forEach(btn => {
                 btn.addEventListener('click', (e) => {
-                    document.querySelectorAll('.filter-btn').forEach(b => 
-                        b.classList.remove('active')
-                    );
+                    document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
                     e.target.classList.add('active');
                     currentFilter = e.target.dataset.filter;
                     renderChats();
                 });
             });
+
+            // 랭킹 탭
+            document.querySelectorAll('.ranking-tab').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    document.querySelectorAll('.ranking-tab').forEach(b => b.classList.remove('active'));
+                    e.target.classList.add('active');
+                    currentRanking = e.target.dataset.ranking;
+                    renderRankings();
+                });
+            });
         });
 
         // 초기화
+        updateClock();
+        setInterval(updateClock, 1000);
         connectWebSocket();
         fetchData();
-        
-        // 정기 동기화 (WebSocket 백업)
-        setInterval(() => {
-            if (!ws || ws.readyState !== WebSocket.OPEN) {
-                fetchData();
-            }
-        }, 10000);
-
-        // 페이지 가시성 변경 감지
-        document.addEventListener('visibilitychange', () => {
-            if (!document.hidden) {
-                if (!ws || ws.readyState !== WebSocket.OPEN) {
-                    connectWebSocket();
-                }
-                fetchData();
-            }
-        });
-
-        // 키보드 단축키
-        document.addEventListener('keydown', (e) => {
-            if (e.key === 'r' && (e.ctrlKey || e.metaKey)) {
-                e.preventDefault();
-                refreshData();
-            }
-        });
+        setInterval(fetchData, 10000);
     </script>
 </body>
 </html>

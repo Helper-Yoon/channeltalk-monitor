@@ -13,6 +13,31 @@ class ChannelHandler {
     // 디버깅용 로그
     console.log('Channel ID initialized:', this.channelId);
     
+    // 태그 매핑 정보 (ID -> 깔끔한 이름)
+    this.tagMappings = {
+      // 스킬 관련
+      '12119': '파트장',
+      '12116': '챗봇진행중',
+      '11844': '기타렌탈',
+      '11800': '정수기',
+      '11801': '재약정',
+      '11799': '인터넷',
+      // 추가 태그는 여기에 계속 추가
+      // '11802': 'TV',
+      // '11803': '모바일',
+      // '11804': '결합상품',
+    };
+    
+    // 접두사 제거 패턴
+    this.prefixPatterns = [
+      /^스킬_/,
+      /^상담톡_/,
+      /^기타_/,
+      /^내부_/,
+      /^테스트_/,
+      /^임시_/
+    ];
+    
     // Redis 클라이언트
     this.redis = null;
     this.connectRedis();
@@ -20,6 +45,49 @@ class ChannelHandler {
     // 캐시
     this.managers = {};
     this.lastManagerLoad = 0;
+  }
+
+  // 태그 정보를 깔끔한 분류명으로 변환
+  getCleanCategory(tags) {
+    if (!tags || tags.length === 0) return '';
+    
+    // 태그 배열에서 분류 찾기
+    for (const tag of tags) {
+      // 태그가 객체인 경우 (ID와 name 포함)
+      if (typeof tag === 'object' && tag !== null) {
+        // ID 매핑 우선 확인
+        if (tag.id && this.tagMappings[String(tag.id)]) {
+          return this.tagMappings[String(tag.id)];
+        }
+        
+        // name에서 접두사 제거
+        if (tag.name) {
+          let cleanName = tag.name;
+          
+          // 모든 접두사 패턴 제거
+          for (const pattern of this.prefixPatterns) {
+            cleanName = cleanName.replace(pattern, '');
+          }
+          
+          cleanName = cleanName.trim();
+          if (cleanName) return cleanName;
+        }
+      }
+      // 태그가 문자열인 경우
+      else if (typeof tag === 'string') {
+        let cleanName = tag;
+        
+        // 모든 접두사 패턴 제거
+        for (const pattern of this.prefixPatterns) {
+          cleanName = cleanName.replace(pattern, '');
+        }
+        
+        cleanName = cleanName.trim();
+        if (cleanName) return cleanName;
+      }
+    }
+    
+    return '';
   }
 
   async connectRedis() {
@@ -62,6 +130,7 @@ class ChannelHandler {
       console.log('🧹 Cleaning up invalid data...');
       const chatIds = await this.redis.zRange('consultations:waiting', 0, -1);
       let fixedCount = 0;
+      let categoryFixedCount = 0;
       
       for (const chatId of chatIds) {
         const data = await this.redis.hGetAll(`consultation:${chatId}`);
@@ -81,6 +150,24 @@ class ChannelHandler {
             needsUpdate = true;
           }
           
+          // 분류 정리 (모든 접두사 제거)
+          if (data.category) {
+            let cleanCategory = data.category;
+            
+            // 모든 접두사 패턴 제거
+            for (const pattern of this.prefixPatterns) {
+              cleanCategory = cleanCategory.replace(pattern, '');
+            }
+            
+            cleanCategory = cleanCategory.trim();
+            
+            if (cleanCategory !== data.category) {
+              data.category = cleanCategory;
+              needsUpdate = true;
+              categoryFixedCount++;
+            }
+          }
+          
           if (needsUpdate) {
             await this.redis.hSet(`consultation:${chatId}`, 
               Object.entries(data).flat()
@@ -89,8 +176,8 @@ class ChannelHandler {
         }
       }
       
-      if (fixedCount > 0) {
-        console.log(`✅ Fixed ${fixedCount} consultations with invalid URLs`);
+      if (fixedCount > 0 || categoryFixedCount > 0) {
+        console.log(`✅ Fixed ${fixedCount} invalid URLs, ${categoryFixedCount} categories`);
       }
     } catch (error) {
       console.error('Error cleaning up invalid data:', error);
@@ -167,12 +254,13 @@ class ChannelHandler {
     try {
       console.log('📥 Loading initial consultations...');
       
-      // 최근 500개만 빠르게 스캔
+      // 진행중(opened) 상태만 가져오기
       const data = await this.makeRequest('/user-chats?state=opened&limit=500&sortOrder=desc');
       const userChats = data.userChats || [];
       
       let unansweredCount = 0;
       let answeredCount = 0;
+      let closedCount = 0;
       
       // 배치 처리 (10개씩)
       for (let i = 0; i < userChats.length; i += 10) {
@@ -180,6 +268,25 @@ class ChannelHandler {
         
         await Promise.all(batch.map(async (chat) => {
           try {
+            // 상담 상태 재확인
+            if (chat.state !== 'opened') {
+              closedCount++;
+              // 혹시 Redis에 있다면 제거
+              await this.removeConsultation(chat.id);
+              return;
+            }
+            
+            // 상세 정보 가져오기 (태그 정보 포함)
+            let fullChat = chat;
+            try {
+              const chatDetail = await this.makeRequest(`/user-chats/${chat.id}`);
+              if (chatDetail.userChat) {
+                fullChat = chatDetail.userChat;
+              }
+            } catch (detailError) {
+              console.log(`Could not get details for chat ${chat.id}, using basic info`);
+            }
+            
             // 최근 메시지 5개 확인 (봇 메시지 건너뛰기 위해)
             const messagesData = await this.makeRequest(
               `/user-chats/${chat.id}/messages?limit=5&sortOrder=desc`
@@ -195,7 +302,7 @@ class ChannelHandler {
               if (lastRealMessage) {
                 // 마지막 실제 메시지가 고객 메시지면 미답변
                 if (lastRealMessage.personType === 'user') {
-                  await this.saveConsultation(chat, lastRealMessage);
+                  await this.saveConsultation(fullChat, lastRealMessage);
                   unansweredCount++;
                 } 
                 // 마지막 실제 메시지가 매니저면 답변완료
@@ -217,7 +324,7 @@ class ChannelHandler {
         }
       }
       
-      console.log(`✅ Initial scan complete: ${unansweredCount} unanswered, ${answeredCount} answered`);
+      console.log(`✅ Initial scan: ${unansweredCount} unanswered, ${answeredCount} answered, ${closedCount} closed`);
       
       // 대시보드 업데이트
       await this.broadcastUpdate();
@@ -240,6 +347,10 @@ class ChannelHandler {
           await this.handleUserChatEvent(event);
           break;
           
+        case 'userChatClose':  // 상담 종료 이벤트
+          await this.handleChatCloseEvent(event);
+          break;
+          
         case 'userChatAssignee':
           await this.handleAssigneeEvent(event);
           break;
@@ -254,6 +365,18 @@ class ChannelHandler {
     } catch (error) {
       console.error('Webhook event processing error:', error);
     }
+  }
+
+  // 상담 종료 이벤트 처리
+  async handleChatCloseEvent(event) {
+    const { entity, refers } = event;
+    const userChat = entity || refers?.userChat;
+    
+    if (!userChat) return;
+    
+    console.log(`🔒 Chat close event for ${userChat.id}`);
+    await this.removeConsultation(userChat.id);
+    await this.broadcastUpdate();
   }
 
   // 메시지 이벤트 처리
@@ -320,10 +443,37 @@ class ChannelHandler {
     const { entity, action } = event;
     const userChat = entity;
     
-    if (action === 'closed' || userChat.state === 'closed') {
-      console.log(`🔒 Chat ${userChat.id} closed`);
+    // 상담 종료 처리 (여러 케이스 체크)
+    if (action === 'closed' || 
+        action === 'close' ||
+        userChat.state === 'closed' ||
+        userChat.state === 'snoozed' ||
+        userChat.state === 'solved') {
+      console.log(`🔒 Chat ${userChat.id} closed/snoozed (state: ${userChat.state}, action: ${action})`);
       await this.removeConsultation(userChat.id);
       await this.broadcastUpdate();
+    }
+    // 상담 재오픈 처리
+    else if ((action === 'opened' || action === 'reopen') && userChat.state === 'opened') {
+      console.log(`🔓 Chat ${userChat.id} reopened`);
+      // 재오픈된 경우 메시지 확인
+      try {
+        const messagesData = await this.makeRequest(
+          `/user-chats/${userChat.id}/messages?limit=5&sortOrder=desc`
+        );
+        const messages = messagesData.messages || [];
+        
+        const lastRealMessage = messages.find(m => 
+          m.personType === 'user' || m.personType === 'manager'
+        );
+        
+        if (lastRealMessage && lastRealMessage.personType === 'user') {
+          await this.saveConsultation(userChat, lastRealMessage);
+          await this.broadcastUpdate();
+        }
+      } catch (error) {
+        console.error(`Error checking reopened chat ${userChat.id}:`, error);
+      }
     }
   }
 
@@ -361,13 +511,14 @@ class ChannelHandler {
     const exists = await this.redis.exists(`consultation:${userChat.id}`);
     if (exists) {
       const tags = entity || [];
-      const skillTag = tags.find(tag => tag.startsWith('스킬_'));
+      const category = this.getCleanCategory(tags);
       
-      if (skillTag) {
+      if (category) {
         await this.redis.hSet(`consultation:${userChat.id}`, {
-          category: skillTag
+          category: category
         });
         
+        console.log(`🏷️ Updated category for chat ${userChat.id}: ${category}`);
         await this.broadcastUpdate();
       }
     }
@@ -376,6 +527,12 @@ class ChannelHandler {
   // 상담 정보 저장
   async saveConsultation(userChat, lastMessage) {
     try {
+      // 종료된 상담은 저장하지 않음
+      if (userChat.state !== 'opened') {
+        console.log(`⚠️ Skipping closed chat ${userChat.id} (state: ${userChat.state})`);
+        return;
+      }
+      
       // 담당자 정보
       let counselorName = '미배정';
       let teamName = '없음';
@@ -386,14 +543,8 @@ class ChannelHandler {
         teamName = this.teamManager.getTeamByName(counselorName);
       }
       
-      // 분류 정보
-      let category = '';
-      if (userChat.tags && userChat.tags.length > 0) {
-        const skillTag = userChat.tags.find(tag => 
-          typeof tag === 'string' && tag.startsWith('스킬_')
-        );
-        if (skillTag) category = skillTag;
-      }
+      // 분류 정보 - 깔끔하게 처리
+      const category = this.getCleanCategory(userChat.tags);
       
       // 고객 정보
       const customerName = userChat.name || 
@@ -412,6 +563,7 @@ class ChannelHandler {
         team: String(teamName),
         counselor: String(counselorName),
         waitTime: String(waitTime),
+        state: String(userChat.state || 'opened'),  // 상태 저장
         createdAt: String(userChat.createdAt),
         frontUpdatedAt: String(lastMessage.createdAt),
         chatUrl: `https://desk.channel.io/#/channels/197228/user_chats/${userChat.id}`
@@ -432,7 +584,7 @@ class ChannelHandler {
       // TTL 설정 (24시간)
       await this.redis.expire(`consultation:${userChat.id}`, 86400);
       
-      console.log(`💾 Saved consultation ${userChat.id}`);
+      console.log(`💾 Saved consultation ${userChat.id} (category: ${category}, state: ${userChat.state})`);
     } catch (error) {
       console.error(`Failed to save consultation ${userChat.id}:`, error);
     }
@@ -456,9 +608,17 @@ class ChannelHandler {
       const chatIds = await this.redis.zRange('consultations:waiting', 0, -1);
       
       const consultations = [];
+      const toRemove = [];
+      
       for (const chatId of chatIds) {
         const data = await this.redis.hGetAll(`consultation:${chatId}`);
         if (data && Object.keys(data).length > 0) {
+          // 상태 체크 - 종료된 상담은 제외
+          if (data.state && data.state !== 'opened') {
+            toRemove.push(chatId);
+            continue;
+          }
+          
           // 대기시간 재계산
           const waitTime = Math.floor((Date.now() - parseInt(data.frontUpdatedAt)) / 60000);
           data.waitTime = String(waitTime);
@@ -472,6 +632,14 @@ class ChannelHandler {
           
           consultations.push(data);
         }
+      }
+      
+      // 종료된 상담 제거
+      if (toRemove.length > 0) {
+        for (const chatId of toRemove) {
+          await this.removeConsultation(chatId);
+        }
+        console.log(`🧹 Removed ${toRemove.length} closed consultations from list`);
       }
       
       // 대기시간 내림차순 정렬
@@ -497,6 +665,7 @@ class ChannelHandler {
       const chatIds = await this.redis.zRange('consultations:waiting', 0, -1);
       let cleanedCount = 0;
       let updatedCount = 0;
+      let closedCount = 0;
       
       // 배치 처리 (5개씩)
       for (let i = 0; i < chatIds.length; i += 5) {
@@ -504,6 +673,17 @@ class ChannelHandler {
         
         await Promise.all(batch.map(async (chatId) => {
           try {
+            // 먼저 상담 상태 확인
+            const chatData = await this.makeRequest(`/user-chats/${chatId}`);
+            const userChat = chatData.userChat;
+            
+            // 종료된 상담이면 제거
+            if (!userChat || userChat.state !== 'opened') {
+              await this.removeConsultation(chatId);
+              closedCount++;
+              return;
+            }
+            
             // 각 상담의 최신 메시지 5개 확인
             const messagesData = await this.makeRequest(
               `/user-chats/${chatId}/messages?limit=5&sortOrder=desc`
@@ -537,7 +717,7 @@ class ChannelHandler {
             // 상담이 닫혔거나 삭제된 경우
             if (error.response?.status === 404) {
               await this.removeConsultation(chatId);
-              cleanedCount++;
+              closedCount++;
             }
           }
         }));
@@ -548,8 +728,8 @@ class ChannelHandler {
         }
       }
       
-      if (cleanedCount > 0 || updatedCount > 0) {
-        console.log(`🧹 Cleanup: ${cleanedCount} answered removed, ${updatedCount} wait times updated`);
+      if (cleanedCount > 0 || updatedCount > 0 || closedCount > 0) {
+        console.log(`🧹 Cleanup: ${cleanedCount} answered, ${closedCount} closed, ${updatedCount} updated`);
         await this.broadcastUpdate();
       }
     } catch (error) {

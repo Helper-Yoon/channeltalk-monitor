@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: ajungdang-unanswered
+    env: python
+    plan: pro
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: REDIS_URL
+        value: redis://red-d2ct46buibrs738rintg:6379
+      - key: WEBHOOK_TOKEN
+        value: 80ab2d11835f44b89010c8efa5eec4b4
+      - key: PORT
+        sync: false
+    autoDeploy: true
+    healthCheckPath: /health

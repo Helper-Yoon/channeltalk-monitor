@@ -133,27 +133,30 @@ class ChannelHandler {
         
         await Promise.all(batch.map(async (chat) => {
           try {
-            // 최근 메시지 3개 확인 (더 정확한 판단을 위해)
+            // 최근 메시지 5개 확인 (봇 메시지 건너뛰기 위해)
             const messagesData = await this.makeRequest(
-              `/user-chats/${chat.id}/messages?limit=3&sortOrder=desc`
+              `/user-chats/${chat.id}/messages?limit=5&sortOrder=desc`
             );
             const messages = messagesData.messages || [];
             
             if (messages.length > 0) {
-              const lastMessage = messages[0];
+              // 봇/시스템 메시지 제외하고 마지막 실제 메시지 찾기
+              const lastRealMessage = messages.find(m => 
+                m.personType === 'user' || m.personType === 'manager'
+              );
               
-              // 마지막 메시지가 고객 메시지면 미답변
-              if (lastMessage.personType === 'user') {
-                await this.saveConsultation(chat, lastMessage);
-                unansweredCount++;
-              } 
-              // 마지막 메시지가 매니저/봇이면 답변완료
-              else if (lastMessage.personType === 'manager' || 
-                       lastMessage.personType === 'bot' ||
-                       lastMessage.personType === 'system') {
-                // 혹시 Redis에 남아있다면 제거
-                await this.removeConsultation(chat.id);
-                answeredCount++;
+              if (lastRealMessage) {
+                // 마지막 실제 메시지가 고객 메시지면 미답변
+                if (lastRealMessage.personType === 'user') {
+                  await this.saveConsultation(chat, lastRealMessage);
+                  unansweredCount++;
+                } 
+                // 마지막 실제 메시지가 매니저면 답변완료
+                else if (lastRealMessage.personType === 'manager') {
+                  // 혹시 Redis에 남아있다면 제거
+                  await this.removeConsultation(chat.id);
+                  answeredCount++;
+                }
               }
             }
           } catch (error) {
@@ -218,33 +221,36 @@ class ChannelHandler {
     
     // 모든 메시지 이벤트에서 최신 상태 확인
     try {
-      // 최신 메시지 2개 확인
+      // 최신 메시지 3개 확인 (봇 메시지 건너뛰기 위해)
       const messagesData = await this.makeRequest(
-        `/user-chats/${userChat.id}/messages?limit=2&sortOrder=desc`
+        `/user-chats/${userChat.id}/messages?limit=5&sortOrder=desc`
       );
       const messages = messagesData.messages || [];
       
       if (messages.length > 0) {
-        const lastMessage = messages[0];
+        // 봇/시스템 메시지를 제외하고 마지막 실제 메시지 찾기
+        const lastRealMessage = messages.find(m => 
+          m.personType === 'user' || m.personType === 'manager'
+        );
         
-        // 마지막 메시지가 고객 메시지인 경우 - 미답변
-        if (lastMessage.personType === 'user') {
-          console.log(`💬 Unanswered - Customer message in chat ${userChat.id}`);
-          await this.saveConsultation(userChat, lastMessage);
-          
-          // 실시간 알림
-          this.io.to('dashboard').emit('consultation:new', {
-            id: String(userChat.id),
-            customerName: userChat.name || '익명',
-            message: lastMessage.plainText || lastMessage.message
-          });
-        }
-        // 마지막 메시지가 매니저/봇 메시지인 경우 - 답변됨
-        else if (lastMessage.personType === 'manager' || 
-                 lastMessage.personType === 'bot' || 
-                 lastMessage.personType === 'system') {
-          console.log(`✅ Answered - Manager/Bot replied to chat ${userChat.id}`);
-          await this.removeConsultation(userChat.id);
+        if (lastRealMessage) {
+          // 마지막 실제 메시지가 고객 메시지인 경우 - 미답변
+          if (lastRealMessage.personType === 'user') {
+            console.log(`💬 Unanswered - Customer is waiting in chat ${userChat.id}`);
+            await this.saveConsultation(userChat, lastRealMessage);
+            
+            // 실시간 알림
+            this.io.to('dashboard').emit('consultation:new', {
+              id: String(userChat.id),
+              customerName: userChat.name || '익명',
+              message: lastRealMessage.plainText || lastRealMessage.message
+            });
+          }
+          // 마지막 실제 메시지가 매니저 메시지인 경우 - 답변됨
+          else if (lastRealMessage.personType === 'manager') {
+            console.log(`✅ Answered - Manager replied to chat ${userChat.id}`);
+            await this.removeConsultation(userChat.id);
+          }
         }
       }
     } catch (error) {
@@ -253,7 +259,7 @@ class ChannelHandler {
       // 폴백: 원래 이벤트 기반 처리
       if (message.personType === 'user') {
         await this.saveConsultation(userChat, message);
-      } else if (message.personType === 'manager' || message.personType === 'bot') {
+      } else if (message.personType === 'manager') {
         await this.removeConsultation(userChat.id);
       }
     }
@@ -430,57 +436,91 @@ class ChannelHandler {
     console.log(`📡 Broadcasted update: ${consultations.length} consultations`);
   }
 
-  // 답변된 상담 정리 (주기적으로 실행)
+  // 답변된 상담 정리 (주기적으로 실행 - 1분마다)
   async cleanupAnsweredChats() {
     try {
       const chatIds = await this.redis.zRange('consultations:waiting', 0, -1);
       let cleanedCount = 0;
+      let updatedCount = 0;
       
-      for (const chatId of chatIds) {
-        try {
-          // 각 상담의 최신 메시지 확인
-          const messagesData = await this.makeRequest(
-            `/user-chats/${chatId}/messages?limit=1&sortOrder=desc`
-          );
-          const messages = messagesData.messages || [];
-          
-          if (messages.length > 0) {
-            const lastMessage = messages[0];
+      // 배치 처리 (5개씩)
+      for (let i = 0; i < chatIds.length; i += 5) {
+        const batch = chatIds.slice(i, i + 5);
+        
+        await Promise.all(batch.map(async (chatId) => {
+          try {
+            // 각 상담의 최신 메시지 5개 확인
+            const messagesData = await this.makeRequest(
+              `/user-chats/${chatId}/messages?limit=5&sortOrder=desc`
+            );
+            const messages = messagesData.messages || [];
             
-            // 마지막 메시지가 매니저/봇이면 제거
-            if (lastMessage.personType === 'manager' || 
-                lastMessage.personType === 'bot' ||
-                lastMessage.personType === 'system') {
+            if (messages.length > 0) {
+              // 봇/시스템 메시지 제외하고 마지막 실제 메시지 찾기
+              const lastRealMessage = messages.find(m => 
+                m.personType === 'user' || m.personType === 'manager'
+              );
+              
+              if (lastRealMessage) {
+                // 마지막 실제 메시지가 매니저면 제거
+                if (lastRealMessage.personType === 'manager') {
+                  await this.removeConsultation(chatId);
+                  cleanedCount++;
+                }
+                // 고객 메시지면 대기시간 업데이트
+                else if (lastRealMessage.personType === 'user') {
+                  const waitTime = Math.floor((Date.now() - lastRealMessage.createdAt) / 60000);
+                  await this.redis.hSet(`consultation:${chatId}`, {
+                    waitTime: String(waitTime),
+                    frontUpdatedAt: String(lastRealMessage.createdAt)
+                  });
+                  updatedCount++;
+                }
+              }
+            }
+          } catch (error) {
+            // 상담이 닫혔거나 삭제된 경우
+            if (error.response?.status === 404) {
               await this.removeConsultation(chatId);
               cleanedCount++;
             }
-            // 고객 메시지면 대기시간 업데이트
-            else if (lastMessage.personType === 'user') {
-              const waitTime = Math.floor((Date.now() - lastMessage.createdAt) / 60000);
-              await this.redis.hSet(`consultation:${chatId}`, {
-                waitTime: String(waitTime),
-                frontUpdatedAt: String(lastMessage.createdAt)
-              });
-            }
           }
-        } catch (error) {
-          // 상담이 닫혔거나 삭제된 경우
-          if (error.response?.status === 404) {
-            await this.removeConsultation(chatId);
-            cleanedCount++;
-          }
-        }
+        }));
         
-        // Rate limit 방지
-        await new Promise(resolve => setTimeout(resolve, 100));
+        // Rate limit 방지 (배치 간 짧은 대기)
+        if (i + 5 < chatIds.length) {
+          await new Promise(resolve => setTimeout(resolve, 200));
+        }
       }
       
-      if (cleanedCount > 0) {
-        console.log(`🧹 Cleaned up ${cleanedCount} answered chats`);
+      if (cleanedCount > 0 || updatedCount > 0) {
+        console.log(`🧹 Cleanup: ${cleanedCount} answered removed, ${updatedCount} wait times updated`);
         await this.broadcastUpdate();
       }
     } catch (error) {
       console.error('Cleanup error:', error);
+    }
+  }
+
+  // 대기시간만 업데이트 (30초마다 실행)
+  async updateWaitTimes() {
+    try {
+      const chatIds = await this.redis.zRange('consultations:waiting', 0, -1);
+      
+      for (const chatId of chatIds) {
+        const data = await this.redis.hGetAll(`consultation:${chatId}`);
+        if (data && data.frontUpdatedAt) {
+          const waitTime = Math.floor((Date.now() - parseInt(data.frontUpdatedAt)) / 60000);
+          await this.redis.hSet(`consultation:${chatId}`, {
+            waitTime: String(waitTime)
+          });
+        }
+      }
+      
+      // 대시보드에 업데이트 전송
+      await this.broadcastUpdate();
+    } catch (error) {
+      console.error('Error updating wait times:', error);
     }
   }
 

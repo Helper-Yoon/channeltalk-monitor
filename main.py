@@ -16,7 +16,8 @@ from collections import defaultdict
 REDIS_URL = os.getenv('REDIS_URL', 'redis://red-d2ct46buibrs738rintg:6379')
 WEBHOOK_TOKEN = '80ab2d11835f44b89010c8efa5eec4b4'
 PORT = int(os.getenv('PORT', 10000))
-CHANNELTALK_DESK_URL = 'https://desk.channel.io/#/channels/@ajungdang/user_chats/'
+CHANNELTALK_ID = '197228'
+CHANNELTALK_DESK_URL = f'https://desk.channel.io/#/channels/{CHANNELTALK_ID}/user_chats/'
 
 # ===== 로깅 설정 =====
 logging.basicConfig(
@@ -26,11 +27,18 @@ logging.basicConfig(
 logger = logging.getLogger('ChannelTalk')
 
 # ===== 상수 정의 =====
-CACHE_TTL = 86400  # 24시간
+CACHE_TTL = 43200  # 12시간 (오래된 상담 자동 정리)
 PING_INTERVAL = 30  # WebSocket ping 간격
 SYNC_INTERVAL = 60  # 데이터 동기화 간격
 MAX_RECONNECT_ATTEMPTS = 5
 RECONNECT_DELAY = 5
+
+# 팀 설정 (필요에 따라 수정)
+TEAMS = {
+    'CS': ['김철수', '이영희', '박민수'],
+    'Sales': ['최지우', '정하늘', '강바다'],
+    'Tech': ['손코딩', '조디버그', '윤서버'],
+}
 
 class ChannelTalkMonitor:
     """고성능 Redis 기반 채널톡 모니터링 시스템"""
@@ -40,10 +48,12 @@ class ChannelTalkMonitor:
         self.redis_pool = None
         self.websockets = weakref.WeakSet()
         self.chat_cache: Dict[str, dict] = {}
+        self.chat_messages: Dict[str, Set[str]] = {}  # 채팅별 메시지 해시 저장
         self.last_sync = 0
         self.stats = defaultdict(int)
         self._running = False
         self._sync_task = None
+        self._cleanup_task = None
         logger.info("🚀 ChannelTalkMonitor 초기화")
         
     async def setup(self):
@@ -66,12 +76,13 @@ class ChannelTalkMonitor:
             await self.redis.ping()
             logger.info("✅ Redis 연결 성공!")
             
-            # 초기 데이터 로드
+            # 초기 데이터 로드 및 정리
             await self._initial_load()
             
-            # 동기화 태스크 시작
+            # 백그라운드 태스크 시작
             self._running = True
             self._sync_task = asyncio.create_task(self._periodic_sync())
+            self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
             
         except Exception as e:
             logger.error(f"❌ Redis 연결 실패: {e}")
@@ -81,12 +92,13 @@ class ChannelTalkMonitor:
         """종료시 정리"""
         self._running = False
         
-        if self._sync_task:
-            self._sync_task.cancel()
-            try:
-                await self._sync_task
-            except asyncio.CancelledError:
-                pass
+        for task in [self._sync_task, self._cleanup_task]:
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         
         if self.redis:
             await self.redis.aclose()
@@ -102,25 +114,50 @@ class ChannelTalkMonitor:
             # 기존 데이터 확인 및 정리
             existing_ids = await self.redis.smembers('unanswered_chats')
             valid_count = 0
+            removed_count = 0
+            
+            current_time = datetime.now(timezone.utc)
             
             for chat_id in existing_ids:
                 chat_data = await self.redis.get(f"chat:{chat_id}")
                 if chat_data:
                     try:
                         data = json.loads(chat_data)
-                        self.chat_cache[chat_id] = data
-                        valid_count += 1
-                    except:
+                        # 오래된 상담 체크 (12시간 이상)
+                        timestamp = data.get('timestamp')
+                        if timestamp:
+                            created = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                            age_hours = (current_time - created).total_seconds() / 3600
+                            
+                            if age_hours > 12:
+                                # 오래된 상담 제거
+                                await self.redis.srem('unanswered_chats', chat_id)
+                                await self.redis.delete(f"chat:{chat_id}")
+                                removed_count += 1
+                                logger.info(f"🧹 오래된 상담 제거: {chat_id} ({age_hours:.1f}시간)")
+                            else:
+                                self.chat_cache[chat_id] = data
+                                valid_count += 1
+                        else:
+                            self.chat_cache[chat_id] = data
+                            valid_count += 1
+                    except Exception as e:
+                        # 손상된 데이터 제거
                         await self.redis.srem('unanswered_chats', chat_id)
+                        await self.redis.delete(f"chat:{chat_id}")
+                        logger.error(f"손상된 데이터 제거: {chat_id} - {e}")
                 else:
+                    # 고아 ID 제거
                     await self.redis.srem('unanswered_chats', chat_id)
+                    removed_count += 1
             
-            logger.info(f"📥 초기 로드: {valid_count}개 미답변 상담")
+            logger.info(f"📥 초기 로드: {valid_count}개 유효 상담, {removed_count}개 제거")
             
             # 통계 초기화
             await self.redis.hset('stats:session', mapping={
                 'start_time': datetime.now(timezone.utc).isoformat(),
-                'initial_count': str(valid_count)
+                'initial_count': str(valid_count),
+                'removed_old': str(removed_count)
             })
             
         except Exception as e:
@@ -137,17 +174,50 @@ class ChannelTalkMonitor:
             except Exception as e:
                 logger.error(f"동기화 오류: {e}")
     
+    async def _periodic_cleanup(self):
+        """주기적 오래된 데이터 정리"""
+        while self._running:
+            try:
+                await asyncio.sleep(3600)  # 1시간마다
+                await self._cleanup_old_data()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"정리 작업 오류: {e}")
+    
+    async def _cleanup_old_data(self):
+        """12시간 이상 된 상담 자동 제거"""
+        try:
+            current_time = datetime.now(timezone.utc)
+            removed_count = 0
+            
+            chat_ids = await self.redis.smembers('unanswered_chats')
+            
+            for chat_id in chat_ids:
+                chat_data = await self.redis.get(f"chat:{chat_id}")
+                if chat_data:
+                    try:
+                        data = json.loads(chat_data)
+                        timestamp = data.get('timestamp')
+                        if timestamp:
+                            created = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                            age_hours = (current_time - created).total_seconds() / 3600
+                            
+                            if age_hours > 12:
+                                await self.remove_chat(chat_id, cleanup=True)
+                                removed_count += 1
+                    except:
+                        pass
+            
+            if removed_count > 0:
+                logger.info(f"🧹 정기 정리: {removed_count}개 오래된 상담 제거")
+                
+        except Exception as e:
+            logger.error(f"정리 작업 실패: {e}")
+    
     async def _sync_data(self):
         """Redis와 메모리 캐시 동기화"""
         try:
-            # 오래된 데이터 정리
-            current_time = int(time.time())
-            cutoff_time = current_time - CACHE_TTL
-            
-            removed = await self.redis.zremrangebyscore('chats_by_time', 0, cutoff_time)
-            if removed:
-                logger.info(f"🧹 {removed}개 오래된 데이터 정리")
-            
             # 캐시 동기화
             redis_ids = await self.redis.smembers('unanswered_chats')
             cache_ids = set(self.chat_cache.keys())
@@ -161,39 +231,48 @@ class ChannelTalkMonitor:
             # 캐시에만 있는 데이터 제거
             for chat_id in cache_ids - redis_ids:
                 del self.chat_cache[chat_id]
+                if chat_id in self.chat_messages:
+                    del self.chat_messages[chat_id]
             
-            self.last_sync = current_time
+            self.last_sync = int(time.time())
             
         except Exception as e:
             logger.error(f"동기화 실패: {e}")
     
     async def save_chat(self, chat_data: dict):
-        """채팅 저장 (중복 방지)"""
+        """채팅 저장 (중복 메시지 방지)"""
         chat_id = str(chat_data['id'])
         
         try:
-            # 중복 체크를 위한 해시 생성
-            content_hash = hashlib.md5(
-                f"{chat_id}:{chat_data.get('lastMessage', '')}:{chat_data.get('timestamp', '')}".encode()
+            # 메시지 해시 생성 (중복 체크용)
+            message_hash = hashlib.md5(
+                f"{chat_data.get('lastMessage', '')}:{chat_data.get('timestamp', '')}".encode()
             ).hexdigest()
             
-            # 이미 존재하는 경우 업데이트만
-            existing_hash = await self.redis.hget(f"chat:{chat_id}:meta", "hash")
-            if existing_hash == content_hash:
+            # 이 채팅의 메시지 해시 세트 가져오기
+            if chat_id not in self.chat_messages:
+                self.chat_messages[chat_id] = set()
+                # Redis에서 기존 해시 로드
+                existing_hashes = await self.redis.smembers(f"chat:{chat_id}:messages")
+                if existing_hashes:
+                    self.chat_messages[chat_id] = set(existing_hashes)
+            
+            # 중복 메시지 체크
+            if message_hash in self.chat_messages[chat_id]:
                 logger.debug(f"⏭️ 중복 메시지 스킵: {chat_id}")
                 return
             
-            # 트랜잭션으로 원자적 처리
+            # 새 메시지 해시 추가
+            self.chat_messages[chat_id].add(message_hash)
+            
+            # Redis에 저장
             pipe = self.redis.pipeline()
             
-            # 메타데이터 저장
-            await pipe.hset(f"chat:{chat_id}:meta", mapping={
-                "hash": content_hash,
-                "updated_at": str(int(time.time()))
-            })
-            await pipe.expire(f"chat:{chat_id}:meta", CACHE_TTL)
+            # 메시지 해시 저장
+            await pipe.sadd(f"chat:{chat_id}:messages", message_hash)
+            await pipe.expire(f"chat:{chat_id}:messages", CACHE_TTL)
             
-            # 채팅 데이터 저장
+            # 채팅 데이터 저장/업데이트
             await pipe.setex(f"chat:{chat_id}", CACHE_TTL, json.dumps(chat_data))
             
             # 인덱스 업데이트
@@ -220,13 +299,12 @@ class ChannelTalkMonitor:
                 'timestamp': datetime.now(timezone.utc).isoformat()
             })
             
-            # 통계 업데이트
             self.stats['saved'] += 1
             
         except Exception as e:
             logger.error(f"❌ 저장 실패 [{chat_id}]: {e}")
     
-    async def remove_chat(self, chat_id: str, manager_name: str = None):
+    async def remove_chat(self, chat_id: str, manager_name: str = None, assignee: str = None, cleanup: bool = False):
         """채팅 제거 및 답변자 기록"""
         chat_id = str(chat_id)
         
@@ -236,19 +314,22 @@ class ChannelTalkMonitor:
             
             # 데이터 제거
             await pipe.delete(f"chat:{chat_id}")
-            await pipe.delete(f"chat:{chat_id}:meta")
+            await pipe.delete(f"chat:{chat_id}:messages")
             await pipe.srem('unanswered_chats', chat_id)
             await pipe.zrem('chats_by_time', chat_id)
             
             # 통계 업데이트
-            await pipe.hincrby('stats:total', 'answered', 1)
-            await pipe.hincrby('stats:today', f"answered:{datetime.now().date()}", 1)
-            
-            # 답변자 랭킹 업데이트
-            if manager_name:
-                today = datetime.now().strftime('%Y-%m-%d')
-                await pipe.hincrby('ranking:daily', f"{today}:{manager_name}", 1)
-                await pipe.hincrby('ranking:total', manager_name, 1)
+            if not cleanup:
+                await pipe.hincrby('stats:total', 'answered', 1)
+                await pipe.hincrby('stats:today', f"answered:{datetime.now().date()}", 1)
+                
+                # 답변자 랭킹 업데이트 (Bot 제외, assignee가 아닌 경우만)
+                if manager_name and manager_name.lower() != 'bot':
+                    if not assignee or manager_name != assignee:
+                        today = datetime.now().strftime('%Y-%m-%d')
+                        await pipe.hincrby('ranking:daily', f"{today}:{manager_name}", 1)
+                        await pipe.hincrby('ranking:total', manager_name, 1)
+                        logger.info(f"📊 랭킹 업데이트: {manager_name} (assignee: {assignee})")
             
             results = await pipe.execute()
             
@@ -257,15 +338,20 @@ class ChannelTalkMonitor:
                 # 캐시에서 제거
                 if chat_id in self.chat_cache:
                     del self.chat_cache[chat_id]
+                if chat_id in self.chat_messages:
+                    del self.chat_messages[chat_id]
                 
-                logger.info(f"✅ 제거: {chat_id} {f'(답변자: {manager_name})' if manager_name else ''}")
+                if cleanup:
+                    logger.info(f"🧹 오래된 상담 정리: {chat_id}")
+                else:
+                    logger.info(f"✅ 제거: {chat_id} {f'(답변자: {manager_name})' if manager_name else ''}")
                 
                 # WebSocket 브로드캐스트
                 await self.broadcast({
                     'type': 'chat_answered',
                     'chatId': chat_id,
                     'total': len(self.chat_cache),
-                    'manager': manager_name,
+                    'manager': manager_name if not cleanup else None,
                     'timestamp': datetime.now(timezone.utc).isoformat()
                 })
                 
@@ -304,6 +390,8 @@ class ChannelTalkMonitor:
             
             # 대기시간 계산 및 정렬
             current_time = datetime.now(timezone.utc)
+            valid_chats = []
+            
             for chat in chats:
                 try:
                     if isinstance(chat.get('timestamp'), str):
@@ -317,23 +405,30 @@ class ChannelTalkMonitor:
                         )
                     
                     wait_seconds = (current_time - created).total_seconds()
+                    
+                    # 12시간 이상된 상담 필터링
+                    if wait_seconds > 43200:
+                        continue
+                    
                     chat['waitMinutes'] = max(0, int(wait_seconds / 60))
                     chat['waitSeconds'] = max(0, int(wait_seconds))
+                    valid_chats.append(chat)
                 except:
                     chat['waitMinutes'] = 0
                     chat['waitSeconds'] = 0
+                    valid_chats.append(chat)
             
             # 대기시간 순 정렬
-            chats.sort(key=lambda x: x.get('waitSeconds', 0), reverse=True)
+            valid_chats.sort(key=lambda x: x.get('waitSeconds', 0), reverse=True)
             
-            return chats
+            return valid_chats
             
         except Exception as e:
             logger.error(f"❌ 조회 실패: {e}")
             return []
     
     async def get_rankings(self) -> dict:
-        """답변 랭킹 조회"""
+        """답변 랭킹 조회 (Bot 제외)"""
         try:
             # 오늘 랭킹
             today = datetime.now().strftime('%Y-%m-%d')
@@ -346,11 +441,17 @@ class ChannelTalkMonitor:
                 cursor, keys = await self.redis.hscan('ranking:daily', cursor, match=daily_pattern)
                 for key, value in keys.items():
                     manager = key.split(':', 1)[1]
-                    daily_data[manager] = int(value)
+                    # Bot 제외
+                    if manager.lower() != 'bot':
+                        daily_data[manager] = int(value)
             
             # 전체 랭킹
             total_data = await self.redis.hgetall('ranking:total')
-            total_ranking = {k: int(v) for k, v in total_data.items()}
+            total_ranking = {}
+            for k, v in total_data.items():
+                # Bot 제외
+                if k.lower() != 'bot':
+                    total_ranking[k] = int(v)
             
             # 정렬
             daily_ranking = sorted(daily_data.items(), key=lambda x: x[1], reverse=True)[:10]
@@ -404,6 +505,10 @@ class ChannelTalkMonitor:
                 user_info = refers.get('user', {})
                 user_chat = refers.get('userChat', {})
                 
+                # assignee 정보 추출
+                assignee_info = user_chat.get('assignee', {})
+                assignee_name = assignee_info.get('name') if assignee_info else None
+                
                 chat_data = {
                     'id': str(chat_id),
                     'customerName': (
@@ -415,7 +520,8 @@ class ChannelTalkMonitor:
                     'lastMessage': entity.get('plainText', ''),
                     'timestamp': entity.get('createdAt', datetime.now(timezone.utc).isoformat()),
                     'channel': refers.get('channel', {}).get('name', ''),
-                    'tags': refers.get('userChat', {}).get('tags', [])
+                    'tags': refers.get('userChat', {}).get('tags', []),
+                    'assignee': assignee_name
                 }
                 
                 await self.save_chat(chat_data)
@@ -424,7 +530,13 @@ class ChannelTalkMonitor:
                 # 답변시 제거
                 manager_info = refers.get('manager', {})
                 manager_name = manager_info.get('name', 'Bot' if person_type == 'bot' else 'Unknown')
-                await self.remove_chat(str(chat_id), manager_name)
+                
+                # assignee 정보 가져오기
+                user_chat = refers.get('userChat', {})
+                assignee_info = user_chat.get('assignee', {})
+                assignee_name = assignee_info.get('name') if assignee_info else None
+                
+                await self.remove_chat(str(chat_id), manager_name, assignee_name)
                 
         except Exception as e:
             logger.error(f"메시지 처리 오류: {e}")
@@ -447,6 +559,12 @@ class ChannelTalkMonitor:
         chats = await self.get_all_chats()
         rankings = await self.get_rankings()
         
+        # 팀별 필터링 (쿼리 파라미터)
+        team = request.query.get('team')
+        if team and team in TEAMS:
+            team_members = TEAMS[team]
+            chats = [c for c in chats if c.get('assignee') in team_members]
+        
         # 통계 수집
         stats = {
             'total': len(chats),
@@ -462,6 +580,7 @@ class ChannelTalkMonitor:
             'chats': chats,
             'stats': stats,
             'rankings': rankings,
+            'teams': list(TEAMS.keys()),
             'timestamp': datetime.now(timezone.utc).isoformat(),
             'lastSync': self.last_sync
         })
@@ -472,9 +591,10 @@ class ChannelTalkMonitor:
             chat_id = request.match_info.get('chat_id')
             data = await request.json() if request.body_exists else {}
             manager_name = data.get('manager', 'Manual')
+            assignee = data.get('assignee')
             
             if chat_id:
-                await self.remove_chat(chat_id, manager_name)
+                await self.remove_chat(chat_id, manager_name, assignee)
                 logger.info(f"✅ 수동 답변 완료: {chat_id} by {manager_name}")
                 return web.json_response({'status': 'ok', 'chatId': chat_id})
             else:
@@ -499,6 +619,7 @@ class ChannelTalkMonitor:
                 'type': 'initial',
                 'chats': chats,
                 'rankings': rankings,
+                'teams': list(TEAMS.keys()),
                 'total': len(chats)
             })
             
@@ -515,7 +636,8 @@ class ChannelTalkMonitor:
                             await ws.send_json({
                                 'type': 'refresh',
                                 'chats': chats,
-                                'rankings': rankings
+                                'rankings': rankings,
+                                'teams': list(TEAMS.keys())
                             })
                     except:
                         pass
@@ -575,26 +697,25 @@ class ChannelTalkMonitor:
         """대시보드 HTML 제공"""
         return web.Response(text=DASHBOARD_HTML, content_type='text/html')
 
-# ===== 아정당 브랜드 최적화 대시보드 =====
+# ===== 최적화된 대시보드 HTML =====
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>아정당 고객센터 | 실시간 상담 모니터</title>
+    <title>채널톡 미답변 상담 모니터링 프로그램</title>
     <style>
         :root {
             /* 아정당 브랜드 컬러 */
             --ajd-blue: #0066CC;
             --ajd-blue-dark: #0052A3;
-            --ajd-blue-light: #4D94FF;
-            --ajd-sky: #E6F2FF;
+            --ajd-blue-light: #E6F2FF;
             
             /* 배경색 */
-            --bg-primary: #FFFFFF;
-            --bg-secondary: #F8FAFB;
-            --bg-card: #FFFFFF;
+            --bg-primary: #FAFBFC;
+            --bg-secondary: #FFFFFF;
+            --bg-hover: #F5F7FA;
             
             /* 텍스트 */
             --text-primary: #1A1A1A;
@@ -605,13 +726,12 @@ DASHBOARD_HTML = """
             --critical: #DC2626;
             --warning: #F59E0B;
             --caution: #EAB308;
-            --normal: #0066CC;
+            --normal: #3B82F6;
             --new: #10B981;
             
             /* 기타 */
             --border: #E5E7EB;
-            --shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
-            --shadow-hover: 0 4px 16px rgba(0, 102, 204, 0.15);
+            --shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
         }
 
         * { 
@@ -621,59 +741,39 @@ DASHBOARD_HTML = """
         }
 
         body {
-            font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-            background: var(--bg-secondary);
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: var(--bg-primary);
             color: var(--text-primary);
             min-height: 100vh;
-            line-height: 1.6;
+            line-height: 1.5;
         }
 
         .container {
-            max-width: 1600px;
+            max-width: 1920px;
             margin: 0 auto;
-            padding: 20px;
+            padding: 16px;
         }
 
         /* 헤더 */
         .header {
-            background: var(--bg-primary);
-            border-radius: 12px;
-            padding: 24px;
-            margin-bottom: 24px;
+            background: var(--bg-secondary);
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
             box-shadow: var(--shadow);
+            border: 1px solid var(--border);
         }
 
         .header-top {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 20px;
-            flex-wrap: wrap;
-            gap: 16px;
-        }
-
-        .logo-section {
-            display: flex;
-            align-items: center;
-            gap: 16px;
-        }
-
-        .logo {
-            width: 40px;
-            height: 40px;
-            background: var(--ajd-blue);
-            border-radius: 8px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            color: white;
-            font-weight: 700;
-            font-size: 18px;
+            margin-bottom: 16px;
         }
 
         .title {
-            font-size: 24px;
-            font-weight: 700;
+            font-size: 20px;
+            font-weight: 600;
             color: var(--text-primary);
         }
 
@@ -683,274 +783,235 @@ DASHBOARD_HTML = """
             align-items: center;
         }
 
-        .current-time {
-            padding: 8px 16px;
-            background: var(--bg-secondary);
-            border-radius: 8px;
-            font-size: 14px;
-            font-weight: 500;
-            color: var(--text-secondary);
-            font-variant-numeric: tabular-nums;
-        }
-
-        .view-toggle {
-            display: flex;
-            background: var(--bg-secondary);
-            border-radius: 8px;
-            padding: 4px;
-        }
-
-        .view-btn {
+        .team-selector {
             padding: 6px 12px;
-            border: none;
-            background: transparent;
-            color: var(--text-secondary);
-            cursor: pointer;
+            border: 1px solid var(--border);
             border-radius: 6px;
+            background: white;
             font-size: 14px;
-            font-weight: 500;
-            transition: all 0.2s;
+            cursor: pointer;
+            outline: none;
         }
 
-        .view-btn.active {
+        .team-selector:focus {
+            border-color: var(--ajd-blue);
+        }
+
+        .refresh-btn {
+            padding: 6px 12px;
             background: var(--ajd-blue);
             color: white;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: background 0.2s;
         }
 
-        /* 통계 카드 */
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-            gap: 12px;
+        .refresh-btn:hover {
+            background: var(--ajd-blue-dark);
         }
 
-        .stat-card {
-            background: var(--bg-secondary);
-            border-radius: 8px;
-            padding: 16px;
-            text-align: center;
-            border: 1px solid var(--border);
-            transition: transform 0.2s;
+        /* 통계 바 */
+        .stats-bar {
+            display: flex;
+            gap: 8px;
+            overflow-x: auto;
+            padding: 4px 0;
         }
 
-        .stat-card:hover {
-            transform: translateY(-2px);
-        }
-
-        .stat-value {
-            font-size: 28px;
-            font-weight: 700;
-            margin-bottom: 4px;
-            font-variant-numeric: tabular-nums;
+        .stat-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 16px;
+            background: var(--bg-hover);
+            border-radius: 6px;
+            white-space: nowrap;
+            min-width: fit-content;
         }
 
         .stat-label {
-            font-size: 12px;
+            font-size: 13px;
             color: var(--text-secondary);
-            font-weight: 500;
         }
 
-        /* 메인 컨텐츠 영역 */
-        .main-content {
+        .stat-value {
+            font-size: 18px;
+            font-weight: 600;
+            font-variant-numeric: tabular-nums;
+        }
+
+        /* 메인 레이아웃 */
+        .main-layout {
             display: grid;
-            grid-template-columns: 1fr 320px;
-            gap: 24px;
-            margin-bottom: 24px;
+            grid-template-columns: 1fr 300px;
+            gap: 20px;
         }
 
-        @media (max-width: 1200px) {
-            .main-content {
+        @media (max-width: 1024px) {
+            .main-layout {
                 grid-template-columns: 1fr;
             }
         }
 
-        /* 상담 리스트 섹션 */
+        /* 상담 테이블 */
         .chats-section {
-            background: var(--bg-primary);
-            border-radius: 12px;
-            padding: 20px;
+            background: var(--bg-secondary);
+            border-radius: 8px;
             box-shadow: var(--shadow);
+            overflow: hidden;
+            border: 1px solid var(--border);
         }
 
-        .section-header {
+        .table-header {
+            padding: 12px 20px;
+            border-bottom: 1px solid var(--border);
+            background: var(--bg-hover);
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 16px;
-            padding-bottom: 12px;
-            border-bottom: 1px solid var(--border);
         }
 
-        .section-title {
-            font-size: 16px;
-            font-weight: 600;
-            color: var(--text-primary);
-        }
-
-        .filter-group {
+        .filter-tabs {
             display: flex;
-            gap: 8px;
+            gap: 4px;
         }
 
-        .filter-btn {
-            padding: 6px 12px;
+        .filter-tab {
+            padding: 4px 12px;
             background: transparent;
-            border: 1px solid var(--border);
+            border: 1px solid transparent;
             color: var(--text-secondary);
-            border-radius: 6px;
+            border-radius: 4px;
             cursor: pointer;
             font-size: 13px;
             font-weight: 500;
             transition: all 0.2s;
         }
 
-        .filter-btn:hover {
-            border-color: var(--ajd-blue);
+        .filter-tab:hover {
+            background: white;
+            border-color: var(--border);
+        }
+
+        .filter-tab.active {
+            background: white;
             color: var(--ajd-blue);
-        }
-
-        .filter-btn.active {
-            background: var(--ajd-blue);
-            color: white;
             border-color: var(--ajd-blue);
         }
 
-        /* 채팅 그리드/리스트 */
-        .chat-container {
-            max-height: calc(100vh - 400px);
-            overflow-y: auto;
+        /* 테이블 */
+        .chat-table {
+            width: 100%;
+            border-collapse: collapse;
         }
 
-        .chat-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
-            gap: 16px;
-        }
-
-        .chat-list {
-            display: flex;
-            flex-direction: column;
-            gap: 8px;
-        }
-
-        /* 채팅 카드 */
-        .chat-card {
-            background: var(--bg-secondary);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            padding: 16px;
-            cursor: pointer;
-            transition: all 0.2s;
-            position: relative;
-            user-select: none;
-        }
-
-        .chat-card:hover {
-            border-color: var(--ajd-blue);
-            box-shadow: var(--shadow-hover);
-            transform: translateY(-2px);
-        }
-
-        .chat-card::before {
-            content: '';
-            position: absolute;
-            left: 0;
-            top: 0;
-            bottom: 0;
-            width: 3px;
-            border-radius: 8px 0 0 8px;
-        }
-
-        .chat-card.critical::before { background: var(--critical); }
-        .chat-card.warning::before { background: var(--warning); }
-        .chat-card.caution::before { background: var(--caution); }
-        .chat-card.normal::before { background: var(--normal); }
-        .chat-card.new::before { background: var(--new); }
-
-        /* 리스트 뷰 스타일 */
-        .chat-list .chat-card {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            padding: 12px 16px;
-        }
-
-        .chat-list .customer-name {
+        .chat-table th {
+            text-align: left;
+            padding: 10px 16px;
+            font-size: 12px;
             font-weight: 600;
-            min-width: 100px;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            background: var(--bg-hover);
+            border-bottom: 1px solid var(--border);
+            position: sticky;
+            top: 0;
+            z-index: 10;
         }
 
-        .chat-list .message-preview {
-            flex: 1;
-            white-space: nowrap;
+        .chat-table td {
+            padding: 12px 16px;
+            font-size: 14px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .chat-table tr {
+            background: white;
+            cursor: pointer;
+            transition: background 0.1s;
+        }
+
+        .chat-table tr:hover {
+            background: var(--ajd-blue-light);
+        }
+
+        .customer-cell {
+            font-weight: 500;
+            color: var(--text-primary);
+        }
+
+        .message-cell {
+            color: var(--text-secondary);
+            max-width: 400px;
             overflow: hidden;
             text-overflow: ellipsis;
+            white-space: nowrap;
         }
 
-        .chat-list .wait-time {
+        .time-cell {
             font-weight: 600;
-            min-width: 60px;
-            text-align: right;
+            font-variant-numeric: tabular-nums;
         }
 
-        /* 그리드 뷰 스타일 */
-        .chat-grid .customer-name {
-            font-size: 15px;
-            font-weight: 600;
-            color: var(--text-primary);
-            margin-bottom: 8px;
-        }
+        .time-cell.critical { color: var(--critical); }
+        .time-cell.warning { color: var(--warning); }
+        .time-cell.caution { color: var(--caution); }
+        .time-cell.normal { color: var(--normal); }
+        .time-cell.new { color: var(--new); }
 
-        .chat-grid .message-preview {
+        .assignee-cell {
             color: var(--text-secondary);
             font-size: 13px;
-            line-height: 1.4;
-            margin-bottom: 12px;
-            display: -webkit-box;
-            -webkit-line-clamp: 2;
-            -webkit-box-orient: vertical;
-            overflow: hidden;
         }
 
-        .chat-grid .chat-footer {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
+        .priority-indicator {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 8px;
         }
 
-        .wait-time {
-            font-size: 13px;
-            font-weight: 600;
-            color: var(--text-secondary);
-        }
-
-        .wait-time.critical { color: var(--critical); }
-        .wait-time.warning { color: var(--warning); }
-        .wait-time.caution { color: var(--caution); }
-        .wait-time.normal { color: var(--normal); }
-        .wait-time.new { color: var(--new); }
+        .priority-indicator.critical { background: var(--critical); }
+        .priority-indicator.warning { background: var(--warning); }
+        .priority-indicator.caution { background: var(--caution); }
+        .priority-indicator.normal { background: var(--normal); }
+        .priority-indicator.new { background: var(--new); }
 
         /* 랭킹 섹션 */
         .ranking-section {
-            background: var(--bg-primary);
-            border-radius: 12px;
-            padding: 20px;
+            background: var(--bg-secondary);
+            border-radius: 8px;
+            padding: 16px;
             box-shadow: var(--shadow);
+            border: 1px solid var(--border);
             height: fit-content;
         }
 
+        .ranking-header {
+            font-size: 14px;
+            font-weight: 600;
+            margin-bottom: 12px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid var(--border);
+        }
+
         .ranking-tabs {
-            display: flex;
-            gap: 8px;
-            margin-bottom: 16px;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 4px;
+            margin-bottom: 12px;
         }
 
         .ranking-tab {
-            flex: 1;
-            padding: 8px;
-            background: var(--bg-secondary);
+            padding: 6px;
+            background: var(--bg-hover);
             border: 1px solid var(--border);
-            border-radius: 6px;
+            border-radius: 4px;
             cursor: pointer;
             text-align: center;
             font-size: 13px;
@@ -968,34 +1029,30 @@ DASHBOARD_HTML = """
         .ranking-list {
             display: flex;
             flex-direction: column;
-            gap: 8px;
+            gap: 6px;
         }
 
         .ranking-item {
             display: flex;
             align-items: center;
-            gap: 12px;
-            padding: 12px;
-            background: var(--bg-secondary);
-            border-radius: 8px;
-            transition: transform 0.2s;
-        }
-
-        .ranking-item:hover {
-            transform: translateX(4px);
+            gap: 8px;
+            padding: 8px;
+            background: var(--bg-hover);
+            border-radius: 4px;
+            font-size: 13px;
         }
 
         .ranking-position {
-            width: 24px;
-            height: 24px;
+            width: 20px;
+            height: 20px;
             background: var(--ajd-blue);
             color: white;
             border-radius: 50%;
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 12px;
-            font-weight: 700;
+            font-size: 11px;
+            font-weight: 600;
         }
 
         .ranking-position.gold { background: #FFD700; color: #000; }
@@ -1005,11 +1062,10 @@ DASHBOARD_HTML = """
         .ranking-name {
             flex: 1;
             font-weight: 500;
-            color: var(--text-primary);
         }
 
         .ranking-count {
-            font-weight: 700;
+            font-weight: 600;
             color: var(--ajd-blue);
         }
 
@@ -1021,62 +1077,38 @@ DASHBOARD_HTML = """
         }
 
         .empty-icon {
-            font-size: 48px;
-            margin-bottom: 16px;
+            font-size: 36px;
+            margin-bottom: 12px;
+            opacity: 0.5;
         }
 
-        .empty-title {
-            font-size: 18px;
-            font-weight: 600;
-            margin-bottom: 8px;
-            color: var(--text-primary);
-        }
-
-        .empty-desc {
+        .empty-message {
             font-size: 14px;
-            color: var(--text-light);
         }
 
         /* 스크롤바 */
         ::-webkit-scrollbar {
-            width: 6px;
-            height: 6px;
+            width: 8px;
+            height: 8px;
         }
 
         ::-webkit-scrollbar-track {
-            background: var(--bg-secondary);
+            background: var(--bg-primary);
         }
 
         ::-webkit-scrollbar-thumb {
-            background: var(--border);
-            border-radius: 3px;
+            background: #CBD5E1;
+            border-radius: 4px;
         }
 
         ::-webkit-scrollbar-thumb:hover {
-            background: var(--ajd-blue);
+            background: #94A3B8;
         }
 
-        /* 토스트 알림 */
-        .toast {
-            position: fixed;
-            bottom: 24px;
-            right: 24px;
-            padding: 12px 20px;
-            background: var(--ajd-blue);
-            color: white;
-            border-radius: 8px;
-            font-size: 14px;
-            font-weight: 500;
-            box-shadow: 0 4px 12px rgba(0, 102, 204, 0.3);
-            transform: translateY(100px);
-            opacity: 0;
-            transition: all 0.3s;
-            z-index: 1000;
-        }
-
-        .toast.show {
-            transform: translateY(0);
-            opacity: 1;
+        /* 테이블 스크롤 컨테이너 */
+        .table-container {
+            max-height: calc(100vh - 280px);
+            overflow-y: auto;
         }
     </style>
 </head>
@@ -1085,94 +1117,102 @@ DASHBOARD_HTML = """
         <!-- 헤더 -->
         <div class="header">
             <div class="header-top">
-                <div class="logo-section">
-                    <div class="logo">아</div>
-                    <h1 class="title">아정당 고객센터 모니터</h1>
-                </div>
+                <h1 class="title">📊 채널톡 미답변 상담 모니터링 프로그램</h1>
                 <div class="header-controls">
-                    <div class="current-time" id="currentTime">-</div>
-                    <div class="view-toggle">
-                        <button class="view-btn active" data-view="grid">카드</button>
-                        <button class="view-btn" data-view="list">리스트</button>
-                    </div>
+                    <select class="team-selector" id="teamSelector">
+                        <option value="all">전체 팀</option>
+                    </select>
+                    <button class="refresh-btn" onclick="refreshData()">새로고침</button>
                 </div>
             </div>
             
-            <!-- 통계 -->
-            <div class="stats-grid">
-                <div class="stat-card">
-                    <div class="stat-value" style="color: var(--ajd-blue)" id="totalCount">0</div>
-                    <div class="stat-label">전체 대기</div>
+            <!-- 통계 바 -->
+            <div class="stats-bar">
+                <div class="stat-item">
+                    <span class="stat-label">전체</span>
+                    <span class="stat-value" style="color: var(--ajd-blue)" id="totalCount">0</span>
                 </div>
-                <div class="stat-card">
-                    <div class="stat-value" style="color: var(--critical)" id="criticalCount">0</div>
-                    <div class="stat-label">긴급 (11분+)</div>
+                <div class="stat-item">
+                    <span class="stat-label">긴급</span>
+                    <span class="stat-value" style="color: var(--critical)" id="criticalCount">0</span>
                 </div>
-                <div class="stat-card">
-                    <div class="stat-value" style="color: var(--warning)" id="warningCount">0</div>
-                    <div class="stat-label">경고 (8-10분)</div>
+                <div class="stat-item">
+                    <span class="stat-label">경고</span>
+                    <span class="stat-value" style="color: var(--warning)" id="warningCount">0</span>
                 </div>
-                <div class="stat-card">
-                    <div class="stat-value" style="color: var(--caution)" id="cautionCount">0</div>
-                    <div class="stat-label">주의 (5-7분)</div>
+                <div class="stat-item">
+                    <span class="stat-label">주의</span>
+                    <span class="stat-value" style="color: var(--caution)" id="cautionCount">0</span>
                 </div>
-                <div class="stat-card">
-                    <div class="stat-value" style="color: var(--normal)" id="normalCount">0</div>
-                    <div class="stat-label">일반 (2-4분)</div>
+                <div class="stat-item">
+                    <span class="stat-label">일반</span>
+                    <span class="stat-value" style="color: var(--normal)" id="normalCount">0</span>
                 </div>
-                <div class="stat-card">
-                    <div class="stat-value" style="color: var(--new)" id="newCount">0</div>
-                    <div class="stat-label">신규 (2분 미만)</div>
+                <div class="stat-item">
+                    <span class="stat-label">신규</span>
+                    <span class="stat-value" style="color: var(--new)" id="newCount">0</span>
                 </div>
             </div>
         </div>
 
-        <!-- 메인 컨텐츠 -->
-        <div class="main-content">
-            <!-- 상담 리스트 -->
+        <!-- 메인 레이아웃 -->
+        <div class="main-layout">
+            <!-- 상담 테이블 -->
             <div class="chats-section">
-                <div class="section-header">
-                    <h2 class="section-title">미답변 상담</h2>
-                    <div class="filter-group">
-                        <button class="filter-btn active" data-filter="all">전체</button>
-                        <button class="filter-btn" data-filter="critical">긴급</button>
-                        <button class="filter-btn" data-filter="warning">경고</button>
-                        <button class="filter-btn" data-filter="caution">주의</button>
+                <div class="table-header">
+                    <div class="filter-tabs">
+                        <button class="filter-tab active" data-filter="all">전체</button>
+                        <button class="filter-tab" data-filter="critical">긴급</button>
+                        <button class="filter-tab" data-filter="warning">경고</button>
+                        <button class="filter-tab" data-filter="caution">주의</button>
+                        <button class="filter-tab" data-filter="normal">일반</button>
+                        <button class="filter-tab" data-filter="new">신규</button>
                     </div>
                 </div>
-                <div class="chat-container">
-                    <div class="chat-grid" id="chatContainer">
-                        <!-- 채팅 카드 동적 생성 -->
-                    </div>
+                <div class="table-container">
+                    <table class="chat-table">
+                        <thead>
+                            <tr>
+                                <th style="width: 40px;"></th>
+                                <th style="width: 120px;">고객명</th>
+                                <th>메시지</th>
+                                <th style="width: 100px;">대기시간</th>
+                                <th style="width: 100px;">담당자</th>
+                            </tr>
+                        </thead>
+                        <tbody id="chatTableBody">
+                            <!-- 동적 생성 -->
+                        </tbody>
+                    </table>
                 </div>
             </div>
 
             <!-- 랭킹 -->
             <div class="ranking-section">
-                <div class="section-header">
-                    <h2 class="section-title">답변 랭킹</h2>
+                <div class="ranking-header">
+                    답변 랭킹 (담당 외 상담 답변)
                 </div>
                 <div class="ranking-tabs">
                     <button class="ranking-tab active" data-ranking="daily">오늘</button>
                     <button class="ranking-tab" data-ranking="total">전체</button>
                 </div>
                 <div class="ranking-list" id="rankingList">
-                    <!-- 랭킹 동적 생성 -->
+                    <!-- 동적 생성 -->
                 </div>
             </div>
         </div>
     </div>
 
-    <div class="toast" id="toast"></div>
-
     <script>
-        const CHANNELTALK_URL = 'https://desk.channel.io/#/channels/@ajungdang/user_chats/';
+        const CHANNELTALK_URL = 'https://desk.channel.io/#/channels/197228/user_chats/';
         
         let ws = null;
         let chats = [];
+        let allChats = [];
         let rankings = { daily: [], total: [] };
+        let teams = [];
         let currentFilter = 'all';
-        let currentView = 'grid';
+        let currentTeam = 'all';
         let currentRanking = 'daily';
         let reconnectAttempts = 0;
 
@@ -1191,78 +1231,43 @@ DASHBOARD_HTML = """
             if (minutes < 60) return `${Math.floor(minutes)}분`;
             const hours = Math.floor(minutes / 60);
             const mins = minutes % 60;
-            return `${hours}시간 ${mins}분`;
+            return mins > 0 ? `${hours}시간 ${mins}분` : `${hours}시간`;
         }
 
-        // 토스트 알림
-        function showToast(message) {
-            const toast = document.getElementById('toast');
-            toast.textContent = message;
-            toast.classList.add('show');
-            setTimeout(() => toast.classList.remove('show'), 3000);
-        }
-
-        // 시계 업데이트
-        function updateClock() {
-            const now = new Date();
-            const timeStr = now.toLocaleString('ko-KR', {
-                month: 'short',
-                day: 'numeric',
-                hour: '2-digit',
-                minute: '2-digit',
-                second: '2-digit',
-                hour12: false
-            });
-            document.getElementById('currentTime').textContent = timeStr;
-        }
-
-        // 채팅 렌더링
-        function renderChats() {
-            const container = document.getElementById('chatContainer');
-            container.className = currentView === 'grid' ? 'chat-grid' : 'chat-list';
+        // 테이블 렌더링
+        function renderTable() {
+            const tbody = document.getElementById('chatTableBody');
             
             // 필터링
-            let filteredChats = chats;
+            let filteredChats = allChats;
             if (currentFilter !== 'all') {
-                filteredChats = chats.filter(chat => 
+                filteredChats = filteredChats.filter(chat => 
                     getPriority(chat.waitMinutes) === currentFilter
                 );
             }
             
             if (filteredChats.length === 0) {
-                container.innerHTML = `
-                    <div class="empty-state">
-                        <div class="empty-icon">✨</div>
-                        <h3 class="empty-title">대기 중인 상담이 없습니다</h3>
-                        <p class="empty-desc">모든 상담이 처리되었습니다</p>
-                    </div>
+                tbody.innerHTML = `
+                    <tr>
+                        <td colspan="5" class="empty-state">
+                            <div class="empty-icon">✨</div>
+                            <div class="empty-message">현재 대기 중인 상담이 없습니다</div>
+                        </td>
+                    </tr>
                 `;
             } else {
-                if (currentView === 'grid') {
-                    container.innerHTML = filteredChats.map(chat => {
-                        const priority = getPriority(chat.waitMinutes);
-                        return `
-                            <div class="chat-card ${priority}" ondblclick="openChat('${chat.id}')">
-                                <div class="customer-name">${chat.customerName || '익명'}</div>
-                                <div class="message-preview">${chat.lastMessage || '(메시지 없음)'}</div>
-                                <div class="chat-footer">
-                                    <span class="wait-time ${priority}">${formatWaitTime(chat.waitMinutes)}</span>
-                                </div>
-                            </div>
-                        `;
-                    }).join('');
-                } else {
-                    container.innerHTML = filteredChats.map(chat => {
-                        const priority = getPriority(chat.waitMinutes);
-                        return `
-                            <div class="chat-card ${priority}" ondblclick="openChat('${chat.id}')">
-                                <div class="customer-name">${chat.customerName || '익명'}</div>
-                                <div class="message-preview">${chat.lastMessage || '(메시지 없음)'}</div>
-                                <div class="wait-time ${priority}">${formatWaitTime(chat.waitMinutes)}</div>
-                            </div>
-                        `;
-                    }).join('');
-                }
+                tbody.innerHTML = filteredChats.map(chat => {
+                    const priority = getPriority(chat.waitMinutes);
+                    return `
+                        <tr ondblclick="openChat('${chat.id}')">
+                            <td><span class="priority-indicator ${priority}"></span></td>
+                            <td class="customer-cell">${chat.customerName || '익명'}</td>
+                            <td class="message-cell">${chat.lastMessage || '(메시지 없음)'}</td>
+                            <td class="time-cell ${priority}">${formatWaitTime(chat.waitMinutes)}</td>
+                            <td class="assignee-cell">${chat.assignee || '-'}</td>
+                        </tr>
+                    `;
+                }).join('');
             }
             
             updateStats();
@@ -1270,17 +1275,21 @@ DASHBOARD_HTML = """
 
         // 통계 업데이트
         function updateStats() {
-            document.getElementById('totalCount').textContent = chats.length;
-            document.getElementById('criticalCount').textContent = 
-                chats.filter(c => c.waitMinutes >= 11).length;
-            document.getElementById('warningCount').textContent = 
-                chats.filter(c => c.waitMinutes >= 8 && c.waitMinutes < 11).length;
-            document.getElementById('cautionCount').textContent = 
-                chats.filter(c => c.waitMinutes >= 5 && c.waitMinutes < 8).length;
-            document.getElementById('normalCount').textContent = 
-                chats.filter(c => c.waitMinutes >= 2 && c.waitMinutes < 5).length;
-            document.getElementById('newCount').textContent = 
-                chats.filter(c => c.waitMinutes < 2).length;
+            const stats = {
+                total: allChats.length,
+                critical: allChats.filter(c => c.waitMinutes >= 11).length,
+                warning: allChats.filter(c => c.waitMinutes >= 8 && c.waitMinutes < 11).length,
+                caution: allChats.filter(c => c.waitMinutes >= 5 && c.waitMinutes < 8).length,
+                normal: allChats.filter(c => c.waitMinutes >= 2 && c.waitMinutes < 5).length,
+                new: allChats.filter(c => c.waitMinutes < 2).length
+            };
+            
+            document.getElementById('totalCount').textContent = stats.total;
+            document.getElementById('criticalCount').textContent = stats.critical;
+            document.getElementById('warningCount').textContent = stats.warning;
+            document.getElementById('cautionCount').textContent = stats.caution;
+            document.getElementById('normalCount').textContent = stats.normal;
+            document.getElementById('newCount').textContent = stats.new;
         }
 
         // 랭킹 렌더링
@@ -1291,7 +1300,7 @@ DASHBOARD_HTML = """
             if (data.length === 0) {
                 list.innerHTML = `
                     <div class="empty-state">
-                        <p class="empty-desc">아직 데이터가 없습니다</p>
+                        <div class="empty-message">아직 데이터가 없습니다</div>
                     </div>
                 `;
             } else {
@@ -1311,6 +1320,19 @@ DASHBOARD_HTML = """
                     `;
                 }).join('');
             }
+        }
+
+        // 팀 셀렉터 업데이트
+        function updateTeamSelector() {
+            const selector = document.getElementById('teamSelector');
+            const currentValue = selector.value;
+            
+            selector.innerHTML = '<option value="all">전체 팀</option>';
+            teams.forEach(team => {
+                selector.innerHTML += `<option value="${team}">${team} 팀</option>`;
+            });
+            
+            selector.value = currentValue;
         }
 
         // 채널톡 열기
@@ -1333,30 +1355,28 @@ DASHBOARD_HTML = """
             ws.onmessage = (event) => {
                 const data = JSON.parse(event.data);
                 
-                if (data.type === 'initial') {
+                if (data.type === 'initial' || data.type === 'refresh') {
                     chats = data.chats || [];
+                    allChats = [...chats];
                     rankings = data.rankings || { daily: [], total: [] };
-                    renderChats();
+                    teams = data.teams || [];
+                    updateTeamSelector();
+                    renderTable();
                     renderRankings();
                 } else if (data.type === 'new_chat') {
                     if (!chats.find(c => c.id === data.chat.id)) {
                         chats.push(data.chat);
-                        chats.sort((a, b) => b.waitMinutes - a.waitMinutes);
-                        renderChats();
-                        showToast(`새 상담: ${data.chat.customerName}`);
+                        allChats = [...chats];
+                        allChats.sort((a, b) => b.waitMinutes - a.waitMinutes);
+                        renderTable();
                     }
                 } else if (data.type === 'chat_answered') {
                     chats = chats.filter(c => c.id !== data.chatId);
-                    renderChats();
+                    allChats = [...chats];
+                    renderTable();
                     if (data.manager) {
-                        // 랭킹 업데이트 필요
                         fetchData();
                     }
-                } else if (data.type === 'refresh') {
-                    chats = data.chats || [];
-                    rankings = data.rankings || { daily: [], total: [] };
-                    renderChats();
-                    renderRankings();
                 }
             };
             
@@ -1375,36 +1395,39 @@ DASHBOARD_HTML = """
         // 데이터 가져오기
         async function fetchData() {
             try {
-                const response = await fetch('/api/chats');
+                const url = currentTeam === 'all' ? '/api/chats' : `/api/chats?team=${currentTeam}`;
+                const response = await fetch(url);
                 const data = await response.json();
                 chats = data.chats || [];
+                allChats = [...chats];
                 rankings = data.rankings || { daily: [], total: [] };
-                renderChats();
+                teams = data.teams || [];
+                updateTeamSelector();
+                renderTable();
                 renderRankings();
             } catch (error) {
                 console.error('데이터 로드 실패:', error);
             }
         }
 
+        // 새로고침
+        function refreshData() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'refresh' }));
+            } else {
+                fetchData();
+            }
+        }
+
         // 이벤트 리스너
         document.addEventListener('DOMContentLoaded', () => {
-            // 뷰 전환
-            document.querySelectorAll('.view-btn').forEach(btn => {
+            // 필터 탭
+            document.querySelectorAll('.filter-tab').forEach(btn => {
                 btn.addEventListener('click', (e) => {
-                    document.querySelectorAll('.view-btn').forEach(b => b.classList.remove('active'));
-                    e.target.classList.add('active');
-                    currentView = e.target.dataset.view;
-                    renderChats();
-                });
-            });
-
-            // 필터
-            document.querySelectorAll('.filter-btn').forEach(btn => {
-                btn.addEventListener('click', (e) => {
-                    document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+                    document.querySelectorAll('.filter-tab').forEach(b => b.classList.remove('active'));
                     e.target.classList.add('active');
                     currentFilter = e.target.dataset.filter;
-                    renderChats();
+                    renderTable();
                 });
             });
 
@@ -1417,14 +1440,18 @@ DASHBOARD_HTML = """
                     renderRankings();
                 });
             });
+
+            // 팀 셀렉터
+            document.getElementById('teamSelector').addEventListener('change', (e) => {
+                currentTeam = e.target.value;
+                fetchData();
+            });
         });
 
         // 초기화
-        updateClock();
-        setInterval(updateClock, 1000);
         connectWebSocket();
         fetchData();
-        setInterval(fetchData, 10000);
+        setInterval(fetchData, 30000); // 30초마다 동기화
     </script>
 </body>
 </html>
@@ -1469,10 +1496,11 @@ async def create_app():
     # 시작/종료 핸들러
     async def on_startup(app):
         logger.info("=" * 60)
-        logger.info("⚡ 아정당 채널톡 실시간 모니터링 시스템")
+        logger.info("📊 채널톡 미답변 상담 모니터링 프로그램")
         logger.info(f"📌 대시보드: http://localhost:{PORT}")
         logger.info(f"🔌 WebSocket: ws://localhost:{PORT}/ws")
         logger.info(f"🎯 웹훅: http://localhost:{PORT}/webhook")
+        logger.info(f"🆔 채널톡 ID: {CHANNELTALK_ID}")
         logger.info("=" * 60)
     
     async def on_cleanup(app):

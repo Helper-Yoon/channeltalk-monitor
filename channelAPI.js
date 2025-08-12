@@ -7,8 +7,11 @@ class ChannelHandler {
     this.io = io;
     this.apiKey = process.env.CHANNEL_API_KEY;
     this.apiSecret = process.env.CHANNEL_API_SECRET;
-    this.channelId = process.env.CHANNEL_ID;
+    this.channelId = process.env.CHANNEL_ID || '197228'; // 기본값 설정
     this.teamManager = new TeamManager();
+    
+    // 디버깅용 로그
+    console.log('Channel ID initialized:', this.channelId);
     
     // Redis 클라이언트
     this.redis = null;
@@ -41,6 +44,9 @@ class ChannelHandler {
   async initialize() {
     console.log('🔧 Initializing Channel Handler...');
     
+    // 0. 잘못된 데이터 정리
+    await this.cleanupInvalidData();
+    
     // 1. 매니저 정보 로드 (캐싱)
     await this.loadManagers();
     
@@ -48,6 +54,47 @@ class ChannelHandler {
     await this.loadInitialConsultations();
     
     console.log('✅ Initialization complete');
+  }
+
+  // 잘못된 데이터 정리
+  async cleanupInvalidData() {
+    try {
+      console.log('🧹 Cleaning up invalid data...');
+      const chatIds = await this.redis.zRange('consultations:waiting', 0, -1);
+      let fixedCount = 0;
+      
+      for (const chatId of chatIds) {
+        const data = await this.redis.hGetAll(`consultation:${chatId}`);
+        if (data) {
+          let needsUpdate = false;
+          
+          // chatUrl 검증 및 수정
+          if (!data.chatUrl || data.chatUrl.includes('undefined')) {
+            data.chatUrl = `https://desk.channel.io/#/channels/197228/user_chats/${chatId}`;
+            needsUpdate = true;
+            fixedCount++;
+          }
+          
+          // ID가 없으면 추가
+          if (!data.id) {
+            data.id = chatId;
+            needsUpdate = true;
+          }
+          
+          if (needsUpdate) {
+            await this.redis.hSet(`consultation:${chatId}`, 
+              Object.entries(data).flat()
+            );
+          }
+        }
+      }
+      
+      if (fixedCount > 0) {
+        console.log(`✅ Fixed ${fixedCount} consultations with invalid URLs`);
+      }
+    } catch (error) {
+      console.error('Error cleaning up invalid data:', error);
+    }
   }
 
   // API 호출 헬퍼
@@ -415,6 +462,14 @@ class ChannelHandler {
           // 대기시간 재계산
           const waitTime = Math.floor((Date.now() - parseInt(data.frontUpdatedAt)) / 60000);
           data.waitTime = String(waitTime);
+          
+          // chatUrl 검증 및 수정 (undefined 방지)
+          if (!data.chatUrl || data.chatUrl.includes('undefined')) {
+            data.chatUrl = `https://desk.channel.io/#/channels/197228/user_chats/${data.id}`;
+            // Redis에도 업데이트
+            await this.redis.hSet(`consultation:${chatId}`, 'chatUrl', data.chatUrl);
+          }
+          
           consultations.push(data);
         }
       }

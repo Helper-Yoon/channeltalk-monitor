@@ -1,163 +1,96 @@
-// src/server.js
-import express from 'express';
-import { createServer } from 'http';
-import { Server } from 'socket.io';
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
-import { initializeRedis } from './redisClient.js';
-import { setupWebhook } from './webhookHandler.js';
-import { ChannelTalkService } from './channelAPI.js';
+const express = require('express');
+const http = require('http');
+const socketIO = require('socket.io');
+const path = require('path');
+require('dotenv').config();
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
+const ChannelHandler = require('./channelAPI');
 
 const app = express();
-const server = createServer(app);
-const io = new Server(server, {
-  cors: { origin: '*' },
+const server = http.createServer(app);
+const io = socketIO(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  },
   transports: ['websocket', 'polling']
 });
 
-// 환경변수
-const PORT = process.env.PORT || 10000;
-const HOST = '0.0.0.0';
+// Middleware
+app.use(express.json());
+app.use(express.static('public'));
 
-// 미들웨어
-app.use(express.raw({ type: 'application/json' }));
-app.use(express.static(join(__dirname, '../public')));
+// Channel Handler 초기화
+const channelHandler = new ChannelHandler(io);
 
-// 글로벌 서비스
-let redisClient;
-let channelService;
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    redis: channelHandler.isRedisConnected(),
+    uptime: process.uptime()
+  });
+});
 
-async function initialize() {
+// Webhook endpoint - 모든 채널톡 이벤트를 수신
+app.post('/webhook', async (req, res) => {
   try {
-    // ⭐️ 1. 먼저 서버 시작 (포트 열기)
-    server.listen(PORT, HOST, () => {
-      console.log(`✅ Server running on http://${HOST}:${PORT}`);
+    // Webhook 토큰 검증
+    const token = req.headers['x-webhook-token'] || req.query.token;
+    if (token !== process.env.WEBHOOK_TOKEN) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    // 이벤트 처리
+    const event = req.body;
+    console.log(`📨 Webhook received: ${event.type}`);
+    
+    // 비동기로 처리 (응답은 즉시)
+    setImmediate(() => {
+      channelHandler.handleWebhookEvent(event);
     });
 
-    // 2. Health check 엔드포인트 즉시 활성화
-    app.get('/health', (req, res) => {
-      res.status(200).json({ 
-        status: 'OK', 
-        timestamp: new Date().toISOString(),
-        redis: redisClient ? 'connected' : 'initializing'
-      });
-    });
-
-    // 3. API 엔드포인트 즉시 활성화  
-    app.get('/api/consultations', async (req, res) => {
-      if (!channelService) {
-        res.json([]);
-        return;
-      }
-      try {
-        const consultations = await channelService.getUnansweredConsultations();
-        res.json(consultations);
-      } catch (error) {
-        res.status(500).json({ error: error.message });
-      }
-    });
-
-    // 4. 이제 Redis와 채널톡 초기화
-    console.log('Server port opened, initializing services...');
-    
-    // Redis 연결
-    console.log('Connecting to Redis...');
-    redisClient = await initializeRedis();
-    
-    // 채널톡 서비스 초기화
-    console.log('Initializing Channel Talk service...');
-    channelService = new ChannelTalkService(redisClient, io);
-    
-    // 웹훅 설정
-    console.log('Setting up webhooks...');
-    setupWebhook(app, redisClient, io, channelService);
-    
-    // WebSocket 연결 처리
-    io.on('connection', (socket) => {
-      console.log('Client connected:', socket.id);
-      
-      socket.on('join:dashboard', async () => {
-        socket.join('dashboard');
-        if (!channelService) {
-          socket.emit('dashboard:init', []);
-          return;
-        }
-        try {
-          const currentData = await channelService.getUnansweredConsultations();
-          socket.emit('dashboard:init', currentData);
-        } catch (error) {
-          console.error('Error sending initial data:', error);
-          socket.emit('dashboard:init', []);
-        }
-      });
-      
-      socket.on('disconnect', () => {
-        console.log('Client disconnected:', socket.id);
-      });
-    });
-    
-    // 5. 백그라운드에서 데이터 로드
-    setTimeout(() => {
-      loadInitialDataInBackground();
-    }, 1000); // 1초 후 시작
-    
+    res.status(200).json({ received: true });
   } catch (error) {
-    console.error('Initialization error:', error);
-    process.exit(1);
+    console.error('Webhook error:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
-}
+});
 
-// 백그라운드에서 초기 데이터 로드
-async function loadInitialDataInBackground() {
-  try {
-    console.log('Starting background data load...');
+// Socket.io 연결 처리
+io.on('connection', (socket) => {
+  console.log('👤 Client connected:', socket.id);
+  
+  socket.on('join:dashboard', async () => {
+    socket.join('dashboard');
+    console.log('📊 Client joined dashboard');
     
-    // 첫 sync는 빠른 스캔으로 (최근 500개만)
-    await channelService.quickSync();
-    console.log('Quick sync completed - dashboard ready!');
-    
-    // 30초마다 동기화
-    setInterval(() => {
-      if (channelService) {
-        channelService.syncOpenChats().catch(console.error);
-      }
-    }, 30000);
-    
-    // 10분 후에 첫 전체 스캔 실행
-    setTimeout(() => {
-      console.log('Starting first full scan in background...');
-      if (channelService) {
-        channelService.syncOpenChats().catch(console.error);
-      }
-    }, 600000); // 10분
-    
-  } catch (error) {
-    console.error('Background data load error:', error);
-  }
-}
+    // 현재 미답변 상담 목록 전송
+    const consultations = await channelHandler.getUnansweredConsultations();
+    socket.emit('dashboard:init', consultations);
+  });
+  
+  socket.on('disconnect', () => {
+    console.log('👤 Client disconnected:', socket.id);
+  });
+});
 
-// 우아한 종료
+// 서버 시작
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, async () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`📡 Webhook endpoint: https://channeltalk-monitor.onrender.com/webhook`);
+  
+  // 초기화
+  await channelHandler.initialize();
+});
+
+// Graceful shutdown
 process.on('SIGTERM', async () => {
-  console.log('SIGTERM received, shutting down...');
-  server.close(async () => {
-    if (redisClient) {
-      await redisClient.quit();
-    }
+  console.log('SIGTERM received, shutting down gracefully');
+  await channelHandler.cleanup();
+  server.close(() => {
     process.exit(0);
   });
 });
-
-process.on('SIGINT', async () => {
-  console.log('SIGINT received, shutting down...');
-  server.close(async () => {
-    if (redisClient) {
-      await redisClient.quit();
-    }
-    process.exit(0);
-  });
-});
-
-initialize();

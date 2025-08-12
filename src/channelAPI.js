@@ -1,4 +1,4 @@
-// src/channelAPI.js - 전체 매니저 문제 해결 버전
+// src/channelAPI.js - 15,000개 전체 스캔 버전
 import fetch from 'node-fetch';
 
 export class ChannelTalkService {
@@ -122,20 +122,6 @@ export class ChannelTalkService {
       
       console.log(`✅ Total managers loaded: ${totalManagers}`);
       
-      // 모든 매니저 이름 출력 (디버깅용)
-      const managerNames = Object.values(this.managers).map(m => m.name);
-      console.log('All manager names:', managerNames);
-      
-      // 팀 멤버 중 매니저 목록에 없는 사람 체크
-      const allTeamMembers = Object.values(this.teamMembers).flat();
-      const missingMembers = allTeamMembers.filter(member => 
-        !managerNames.some(manager => manager.includes(member))
-      );
-      
-      if (missingMembers.length > 0) {
-        console.log('⚠️ Team members NOT found in managers:', missingMembers);
-      }
-      
     } catch (error) {
       console.error('Failed to load managers:', error);
     }
@@ -160,21 +146,9 @@ export class ChannelTalkService {
         if (fullName.includes(member) || member.includes(fullName)) {
           return team;
         }
-        // 성만 같아도 매칭 (예: "김시윤" -> "김")
-        if (fullName.length >= 2 && member.length >= 2) {
-          if (fullName[0] === member[0]) {
-            // 성이 같고 이름의 일부가 매칭되는 경우
-            const firstName = fullName.substring(1);
-            const memberFirst = member.substring(1);
-            if (firstName.includes(memberFirst) || memberFirst.includes(firstName)) {
-              return team;
-            }
-          }
-        }
       }
     }
     
-    console.log(`⚠️ Team not found for: ${fullName}`);
     return '기타';
   }
 
@@ -199,15 +173,45 @@ export class ChannelTalkService {
         console.log(`Using cached managers (${Object.keys(this.managers).length} managers)`);
       }
       
-      // 열린 상담 조회
-      const data = await this.makeRequest('/user-chats?state=opened&limit=200&sortOrder=desc');
-      const userChats = data.userChats || [];
+      // ⭐️ 모든 열린 상담 가져오기 (페이지네이션)
+      const allUserChats = [];
+      let offset = 0;
+      let hasMore = true;
+      const limit = 500; // 한번에 500개씩
       
-      console.log(`Found ${userChats.length} open chats`);
+      console.log('Fetching ALL open chats...');
+      
+      while (hasMore) {
+        try {
+          const data = await this.makeRequest(`/user-chats?state=opened&limit=${limit}&offset=${offset}&sortOrder=desc`);
+          const userChats = data.userChats || [];
+          
+          allUserChats.push(...userChats);
+          console.log(`Fetched batch: ${userChats.length} chats (total: ${allUserChats.length})`);
+          
+          if (userChats.length < limit) {
+            hasMore = false;
+          } else {
+            offset += limit;
+            await this.delay(500); // Rate limit 방지
+          }
+          
+          // 안전장치: 20000개 이상이면 중단
+          if (allUserChats.length > 20000) {
+            console.warn('Safety limit reached: 20000 chats');
+            hasMore = false;
+          }
+        } catch (error) {
+          console.error(`Error fetching chats at offset ${offset}:`, error);
+          hasMore = false;
+        }
+      }
+      
+      console.log(`✅ Total open chats found: ${allUserChats.length}`);
       
       // 기존 상담 ID 목록 가져오기
       const existingIds = await this.redis.zRange('consultations:waiting', 0, -1);
-      const currentIds = new Set(userChats.map(chat => String(chat.id)));
+      const currentIds = new Set(allUserChats.map(chat => String(chat.id)));
       
       // 삭제된 상담 제거
       for (const id of existingIds) {
@@ -221,13 +225,23 @@ export class ChannelTalkService {
       // 미답변 상담 찾기 (배치 처리)
       const unansweredChats = [];
       const batchSize = 10; // 한번에 10개씩 처리
-      let debugCount = 0;
+      let processedCount = 0;
+      let unansweredCount = 0;
       
-      for (let i = 0; i < userChats.length; i += batchSize) {
-        const batch = userChats.slice(i, i + batchSize);
+      console.log('Processing chats for unanswered messages...');
+      
+      for (let i = 0; i < allUserChats.length; i += batchSize) {
+        const batch = allUserChats.slice(i, i + batchSize);
         
         await Promise.all(batch.map(async (chat) => {
           try {
+            processedCount++;
+            
+            // 진행 상황 로그 (1000개마다)
+            if (processedCount % 1000 === 0) {
+              console.log(`Progress: ${processedCount}/${allUserChats.length} chats processed, ${unansweredCount} unanswered found`);
+            }
+            
             // 이미 처리한 채팅은 스킵
             const existingData = await this.redis.hGetAll(`consultation:${chat.id}`);
             if (existingData && Object.keys(existingData).length > 0) {
@@ -235,6 +249,7 @@ export class ChannelTalkService {
               const waitTime = this.calculateWaitTime(parseInt(existingData.frontUpdatedAt));
               existingData.waitTime = String(waitTime);
               unansweredChats.push(existingData);
+              unansweredCount++;
               return;
             }
             
@@ -262,15 +277,9 @@ export class ChannelTalkService {
                   const assignee = this.managers[fullChat.assigneeId];
                   counselorName = assignee.name || assignee.displayName || '미배정';
                   teamName = this.findTeamByName(counselorName);
-                  
-                  // 디버깅: 처음 10개 상담만 로그
-                  if (debugCount < 10) {
-                    console.log(`Chat ${chat.id}: assigneeId=${fullChat.assigneeId}, name=${counselorName}, team=${teamName}`);
-                    debugCount++;
-                  }
                 } else {
                   // assigneeId는 있는데 매니저 목록에 없는 경우
-                  console.log(`❌ Manager NOT in cache - assigneeId: ${fullChat.assigneeId}, chatId: ${chat.id}`);
+                  console.log(`❌ Manager NOT in cache - assigneeId: ${fullChat.assigneeId}`);
                   
                   // 개별적으로 매니저 정보 조회 시도
                   try {
@@ -322,6 +331,7 @@ export class ChannelTalkService {
               };
               
               unansweredChats.push(consultationData);
+              unansweredCount++;
               
               // Redis에 저장
               const redisData = Object.entries(consultationData)
@@ -342,12 +352,12 @@ export class ChannelTalkService {
         }));
         
         // 배치 간 딜레이
-        if (i + batchSize < userChats.length) {
+        if (i + batchSize < allUserChats.length) {
           await this.delay(1000);
         }
       }
       
-      console.log(`=== Sync complete: ${unansweredChats.length} unanswered chats (${this.apiCallCount} API calls) ===`);
+      console.log(`=== Sync complete: ${unansweredChats.length} unanswered chats from ${allUserChats.length} total (${this.apiCallCount} API calls) ===`);
       
       // 정렬: 대기시간 내림차순
       unansweredChats.sort((a, b) => {

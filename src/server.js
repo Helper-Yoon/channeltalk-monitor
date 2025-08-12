@@ -1,3 +1,4 @@
+// src/server.js
 import express from 'express';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
@@ -43,14 +44,14 @@ async function initialize() {
     console.log('Setting up webhooks...');
     setupWebhook(app, redisClient, io, channelService);
     
-    // 초기 데이터 로드
-    console.log('Loading initial data...');
-    await channelService.syncOpenChats();
-    
-    // 30초마다 동기화
-    setInterval(() => {
-      channelService.syncOpenChats().catch(console.error);
-    }, 30000);
+    // ⭐️ 서버 먼저 시작 (포트 열기)
+    server.listen(PORT, HOST, () => {
+      console.log(`✅ Server running on http://${HOST}:${PORT}`);
+      
+      // ⭐️ 서버 시작 후에 초기 데이터 로드
+      console.log('Server started, now loading initial data in background...');
+      loadInitialDataInBackground();
+    });
     
     // WebSocket 연결 처리
     io.on('connection', (socket) => {
@@ -90,14 +91,44 @@ async function initialize() {
       }
     });
     
-    // 서버 시작
-    server.listen(PORT, HOST, () => {
-      console.log(`✅ Server running on http://${HOST}:${PORT}`);
+    // API 엔드포인트 추가
+    app.get('/api/consultations', async (req, res) => {
+      try {
+        const consultations = await channelService.getUnansweredConsultations();
+        res.json(consultations);
+      } catch (error) {
+        res.status(500).json({ error: error.message });
+      }
     });
     
   } catch (error) {
     console.error('Initialization error:', error);
     process.exit(1);
+  }
+}
+
+// 백그라운드에서 초기 데이터 로드
+async function loadInitialDataInBackground() {
+  try {
+    console.log('Starting background data load...');
+    
+    // 첫 sync는 빠른 스캔으로 (최근 500개만)
+    await channelService.quickSync();
+    console.log('Quick sync completed - dashboard ready!');
+    
+    // 30초마다 동기화
+    setInterval(() => {
+      channelService.syncOpenChats().catch(console.error);
+    }, 30000);
+    
+    // 5분 후에 첫 전체 스캔 실행
+    setTimeout(() => {
+      console.log('Starting first full scan...');
+      channelService.syncOpenChats().catch(console.error);
+    }, 300000); // 5분
+    
+  } catch (error) {
+    console.error('Background data load error:', error);
   }
 }
 

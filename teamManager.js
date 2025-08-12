@@ -181,7 +181,7 @@ class TeamManager {
   getTeamStats(consultations) {
     const stats = {};
     
-    // 초기화
+    // 초기화 (실제 팀만)
     this.getAllTeams().forEach(team => {
       stats[team] = {
         total: 0,
@@ -192,6 +192,7 @@ class TeamManager {
       };
     });
     
+    // 미배정도 내부적으로는 추적 (하지만 필터에는 표시 안 함)
     stats['없음'] = {
       total: 0,
       critical: 0,

@@ -125,6 +125,7 @@ class ChannelHandler {
       const userChats = data.userChats || [];
       
       let unansweredCount = 0;
+      let answeredCount = 0;
       
       // 배치 처리 (10개씩)
       for (let i = 0; i < userChats.length; i += 10) {
@@ -132,16 +133,28 @@ class ChannelHandler {
         
         await Promise.all(batch.map(async (chat) => {
           try {
-            // 최근 메시지 확인
+            // 최근 메시지 3개 확인 (더 정확한 판단을 위해)
             const messagesData = await this.makeRequest(
-              `/user-chats/${chat.id}/messages?limit=2&sortOrder=desc`
+              `/user-chats/${chat.id}/messages?limit=3&sortOrder=desc`
             );
             const messages = messagesData.messages || [];
             
-            if (messages.length > 0 && messages[0].personType === 'user') {
-              // 미답변 상담
-              await this.saveConsultation(chat, messages[0]);
-              unansweredCount++;
+            if (messages.length > 0) {
+              const lastMessage = messages[0];
+              
+              // 마지막 메시지가 고객 메시지면 미답변
+              if (lastMessage.personType === 'user') {
+                await this.saveConsultation(chat, lastMessage);
+                unansweredCount++;
+              } 
+              // 마지막 메시지가 매니저/봇이면 답변완료
+              else if (lastMessage.personType === 'manager' || 
+                       lastMessage.personType === 'bot' ||
+                       lastMessage.personType === 'system') {
+                // 혹시 Redis에 남아있다면 제거
+                await this.removeConsultation(chat.id);
+                answeredCount++;
+              }
             }
           } catch (error) {
             console.error(`Error checking chat ${chat.id}:`, error.message);
@@ -154,7 +167,7 @@ class ChannelHandler {
         }
       }
       
-      console.log(`✅ Found ${unansweredCount} unanswered consultations`);
+      console.log(`✅ Initial scan complete: ${unansweredCount} unanswered, ${answeredCount} answered`);
       
       // 대시보드 업데이트
       await this.broadcastUpdate();
@@ -201,26 +214,48 @@ class ChannelHandler {
     
     if (!userChat) return;
     
-    // 고객 메시지인 경우
-    if (message.personType === 'user') {
-      console.log(`💬 Customer message in chat ${userChat.id}`);
+    console.log(`📝 Message event - Type: ${message.personType}, Chat: ${userChat.id}`);
+    
+    // 모든 메시지 이벤트에서 최신 상태 확인
+    try {
+      // 최신 메시지 2개 확인
+      const messagesData = await this.makeRequest(
+        `/user-chats/${userChat.id}/messages?limit=2&sortOrder=desc`
+      );
+      const messages = messagesData.messages || [];
       
-      // 상담 정보 저장/업데이트
-      await this.saveConsultation(userChat, message);
+      if (messages.length > 0) {
+        const lastMessage = messages[0];
+        
+        // 마지막 메시지가 고객 메시지인 경우 - 미답변
+        if (lastMessage.personType === 'user') {
+          console.log(`💬 Unanswered - Customer message in chat ${userChat.id}`);
+          await this.saveConsultation(userChat, lastMessage);
+          
+          // 실시간 알림
+          this.io.to('dashboard').emit('consultation:new', {
+            id: String(userChat.id),
+            customerName: userChat.name || '익명',
+            message: lastMessage.plainText || lastMessage.message
+          });
+        }
+        // 마지막 메시지가 매니저/봇 메시지인 경우 - 답변됨
+        else if (lastMessage.personType === 'manager' || 
+                 lastMessage.personType === 'bot' || 
+                 lastMessage.personType === 'system') {
+          console.log(`✅ Answered - Manager/Bot replied to chat ${userChat.id}`);
+          await this.removeConsultation(userChat.id);
+        }
+      }
+    } catch (error) {
+      console.error(`Error checking messages for chat ${userChat.id}:`, error);
       
-      // 실시간 알림
-      this.io.to('dashboard').emit('consultation:new', {
-        id: String(userChat.id),
-        customerName: userChat.name || '익명',
-        message: message.plainText || message.message
-      });
-    }
-    // 매니저 메시지인 경우
-    else if (message.personType === 'manager') {
-      console.log(`💼 Manager replied to chat ${userChat.id}`);
-      
-      // 답변된 상담 제거
-      await this.removeConsultation(userChat.id);
+      // 폴백: 원래 이벤트 기반 처리
+      if (message.personType === 'user') {
+        await this.saveConsultation(userChat, message);
+      } else if (message.personType === 'manager' || message.personType === 'bot') {
+        await this.removeConsultation(userChat.id);
+      }
     }
     
     // 대시보드 업데이트
@@ -326,7 +361,7 @@ class ChannelHandler {
         waitTime: String(waitTime),
         createdAt: String(userChat.createdAt),
         frontUpdatedAt: String(lastMessage.createdAt),
-        chatUrl: `https://desk.channel.io/#/channels/${this.channelId}/user_chats/${userChat.id}`
+        chatUrl: `https://desk.channel.io/#/channels/197228/user_chats/${userChat.id}`
       };
       
       // Redis에 저장
@@ -393,6 +428,60 @@ class ChannelHandler {
     const consultations = await this.getUnansweredConsultations();
     this.io.to('dashboard').emit('dashboard:update', consultations);
     console.log(`📡 Broadcasted update: ${consultations.length} consultations`);
+  }
+
+  // 답변된 상담 정리 (주기적으로 실행)
+  async cleanupAnsweredChats() {
+    try {
+      const chatIds = await this.redis.zRange('consultations:waiting', 0, -1);
+      let cleanedCount = 0;
+      
+      for (const chatId of chatIds) {
+        try {
+          // 각 상담의 최신 메시지 확인
+          const messagesData = await this.makeRequest(
+            `/user-chats/${chatId}/messages?limit=1&sortOrder=desc`
+          );
+          const messages = messagesData.messages || [];
+          
+          if (messages.length > 0) {
+            const lastMessage = messages[0];
+            
+            // 마지막 메시지가 매니저/봇이면 제거
+            if (lastMessage.personType === 'manager' || 
+                lastMessage.personType === 'bot' ||
+                lastMessage.personType === 'system') {
+              await this.removeConsultation(chatId);
+              cleanedCount++;
+            }
+            // 고객 메시지면 대기시간 업데이트
+            else if (lastMessage.personType === 'user') {
+              const waitTime = Math.floor((Date.now() - lastMessage.createdAt) / 60000);
+              await this.redis.hSet(`consultation:${chatId}`, {
+                waitTime: String(waitTime),
+                frontUpdatedAt: String(lastMessage.createdAt)
+              });
+            }
+          }
+        } catch (error) {
+          // 상담이 닫혔거나 삭제된 경우
+          if (error.response?.status === 404) {
+            await this.removeConsultation(chatId);
+            cleanedCount++;
+          }
+        }
+        
+        // Rate limit 방지
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      
+      if (cleanedCount > 0) {
+        console.log(`🧹 Cleaned up ${cleanedCount} answered chats`);
+        await this.broadcastUpdate();
+      }
+    } catch (error) {
+      console.error('Cleanup error:', error);
+    }
   }
 
   // 정리

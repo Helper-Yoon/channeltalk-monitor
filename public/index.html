@@ -3,13 +3,391 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>채널톡 실시간 상담 모니터링</title>
-    <link rel="stylesheet" href="styles.css">
+    <title>채널톡 미답변 상담 실시간 모니터 프로그램</title>
+    <style>
+        :root {
+            --bg-primary: #000000;
+            --bg-secondary: #0a0a0a;
+            --bg-card: #141414;
+            --text-primary: #ffffff;
+            --text-secondary: #a0a0a0;
+            --text-dim: #606060;
+            --accent-blue: #0066CC;  /* 아정당 블루 */
+            --accent-blue-hover: #0080FF;
+            --accent-blue-dim: rgba(0, 102, 204, 0.2);
+            --border-color: #1a1a1a;
+            --shadow: 0 10px 40px rgba(0, 0, 0, 0.9);
+            --shadow-hover: 0 20px 50px rgba(0, 102, 204, 0.3);
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans KR', sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        /* 스크롤바 스타일 */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: var(--bg-secondary);
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--accent-blue);
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--accent-blue-hover);
+        }
+
+        .dashboard-container {
+            width: 100%;
+            min-height: 100vh;
+            background: var(--bg-primary);
+        }
+
+        .dashboard-header {
+            background: var(--bg-secondary);
+            border-bottom: 2px solid var(--accent-blue-dim);
+            padding: 1.5rem 2rem;
+            box-shadow: 0 4px 30px rgba(0, 0, 0, 0.8);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        .dashboard-title {
+            color: var(--accent-blue);
+            font-size: 1.875rem;
+            font-weight: 800;
+            letter-spacing: -0.5px;
+            text-shadow: 0 0 30px rgba(0, 102, 204, 0.6);
+        }
+
+        .header-info {
+            display: flex;
+            align-items: center;
+            gap: 2.5rem;
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+        }
+
+        .connection-status {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 1rem;
+            background: rgba(0, 102, 204, 0.1);
+            border: 1px solid rgba(0, 102, 204, 0.3);
+            border-radius: 8px;
+        }
+
+        .status-indicator {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #10b981;
+            animation: pulse 2s infinite;
+            box-shadow: 0 0 10px rgba(16, 185, 129, 0.5);
+        }
+
+        @keyframes pulse {
+            0%, 100% { 
+                opacity: 1; 
+                transform: scale(1);
+            }
+            50% { 
+                opacity: 0.5; 
+                transform: scale(0.9);
+            }
+        }
+
+        #total-count {
+            font-weight: 700;
+            color: var(--accent-blue);
+            font-size: 1rem;
+        }
+
+        #current-time {
+            font-family: 'SF Mono', 'Monaco', monospace;
+            color: var(--text-dim);
+        }
+
+        .dashboard-content {
+            padding: 2rem;
+            max-width: 1800px;
+            margin: 0 auto;
+        }
+
+        .team-filter {
+            display: flex;
+            gap: 0.75rem;
+            margin-bottom: 2rem;
+            flex-wrap: wrap;
+            padding: 1rem;
+            background: var(--bg-secondary);
+            border-radius: 12px;
+            border: 1px solid var(--border-color);
+        }
+
+        .team-filter-btn {
+            padding: 0.75rem 1.5rem;
+            border: 2px solid #1a1a1a;
+            background: var(--bg-card);
+            color: var(--text-secondary);
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            font-size: 0.875rem;
+            font-weight: 600;
+            letter-spacing: 0.3px;
+        }
+
+        .team-filter-btn:hover {
+            border-color: var(--accent-blue);
+            color: var(--accent-blue);
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0, 102, 204, 0.2);
+        }
+
+        .team-filter-btn.active {
+            background: var(--accent-blue);
+            border-color: var(--accent-blue);
+            color: white;
+            box-shadow: 0 0 20px rgba(0, 102, 204, 0.5);
+        }
+
+        .dashboard-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+            gap: 1.5rem;
+        }
+
+        .consultation-card {
+            background: var(--bg-card);
+            border: 1px solid #1a1a1a;
+            border-radius: 12px;
+            padding: 1.5rem;
+            box-shadow: var(--shadow);
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            cursor: pointer;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .consultation-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 2px;
+            background: linear-gradient(90deg, transparent, var(--accent-blue), transparent);
+            transform: translateX(-100%);
+            transition: transform 0.5s;
+        }
+
+        .consultation-card:hover::before {
+            transform: translateX(100%);
+        }
+
+        .consultation-card:hover {
+            transform: translateY(-4px);
+            box-shadow: var(--shadow-hover);
+            border-color: rgba(0, 102, 204, 0.5);
+            background: #1a1a1a;
+        }
+
+        .consultation-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 1rem;
+        }
+
+        .customer-name {
+            font-size: 1.125rem;
+            font-weight: 700;
+            color: var(--text-primary);
+            letter-spacing: -0.3px;
+        }
+
+        .wait-time-indicator {
+            padding: 0.5rem 0.875rem;
+            border-radius: 6px;
+            font-weight: 700;
+            font-size: 0.8125rem;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.375rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .wait-time-indicator::before {
+            content: '';
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background-color: currentColor;
+            animation: pulse 2s infinite;
+        }
+
+        /* 대기시간 색상 - 진한 다크모드 */
+        .wait-time-green {
+            background: rgba(16, 185, 129, 0.1);
+            color: #10b981;
+            border: 1px solid rgba(16, 185, 129, 0.2);
+        }
+
+        .wait-time-blue {
+            background: rgba(0, 102, 204, 0.1);
+            color: var(--accent-blue);
+            border: 1px solid rgba(0, 102, 204, 0.2);
+        }
+
+        .wait-time-yellow {
+            background: rgba(250, 204, 21, 0.1);
+            color: #facc15;
+            border: 1px solid rgba(250, 204, 21, 0.2);
+        }
+
+        .wait-time-orange {
+            background: rgba(251, 146, 60, 0.1);
+            color: #fb923c;
+            border: 1px solid rgba(251, 146, 60, 0.2);
+        }
+
+        .wait-time-red {
+            background: rgba(239, 68, 68, 0.1);
+            color: #ef4444;
+            border: 1px solid rgba(239, 68, 68, 0.2);
+        }
+
+        .consultation-details {
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+            line-height: 1.8;
+        }
+
+        .consultation-details p {
+            margin: 0.5rem 0;
+            display: flex;
+            align-items: center;
+        }
+
+        .detail-label {
+            font-weight: 600;
+            color: var(--text-dim);
+            margin-right: 0.75rem;
+            min-width: 60px;
+            font-size: 0.8125rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .detail-value {
+            color: var(--text-primary);
+        }
+
+        .customer-message {
+            margin-top: 1rem;
+            padding-top: 1rem;
+            border-top: 1px solid rgba(0, 102, 204, 0.1);
+            color: var(--text-secondary);
+            line-height: 1.6;
+            max-height: 3.5rem;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            font-size: 0.875rem;
+        }
+
+        .no-data {
+            grid-column: 1 / -1;
+            text-align: center;
+            padding: 4rem;
+            color: var(--text-dim);
+            font-size: 1.125rem;
+            background: var(--bg-secondary);
+            border-radius: 12px;
+            border: 1px solid var(--border-color);
+        }
+
+        /* 팀별 강조 색상 - 연한 톤 */
+        .team-SNS1팀 {
+            border-left: 3px solid #86efac;  /* 연초록 */
+        }
+
+        .team-SNS2팀 {
+            border-left: 3px solid #93c5fd;  /* 연파랑 */
+        }
+
+        .team-SNS3팀 {
+            border-left: 3px solid #fde047;  /* 연노랑 */
+        }
+
+        .team-SNS4팀 {
+            border-left: 3px solid #fca5a5;  /* 연빨강 */
+        }
+
+        .team-의정부SNS팀 {
+            border-left: 3px solid #1e40af;  /* 진파랑 */
+        }
+
+        .team-없음 {
+            border-left: 3px solid #6b7280;  /* 회색 */
+        }
+
+        /* 반응형 디자인 */
+        @media (max-width: 768px) {
+            .dashboard-header {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 1rem;
+                padding: 1rem;
+            }
+            
+            .dashboard-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .team-filter {
+                justify-content: center;
+            }
+            
+            .dashboard-content {
+                padding: 1rem;
+            }
+
+            .dashboard-title {
+                font-size: 1.25rem;
+            }
+        }
+    </style>
 </head>
 <body>
     <div class="dashboard-container">
         <header class="dashboard-header">
-            <h1 class="dashboard-title">실시간 상담 모니터링</h1>
+            <h1 class="dashboard-title">채널톡 미답변 상담 실시간 모니터 프로그램</h1>
             <div class="header-info">
                 <div class="connection-status">
                     <span class="status-indicator"></span>
@@ -28,15 +406,246 @@
                 <button class="team-filter-btn" data-team="SNS 3팀">SNS 3팀</button>
                 <button class="team-filter-btn" data-team="SNS 4팀">SNS 4팀</button>
                 <button class="team-filter-btn" data-team="의정부 SNS팀">의정부 SNS팀</button>
+                <button class="team-filter-btn" data-team="없음">미배정</button>
             </div>
 
             <div id="consultations-grid" class="dashboard-grid">
-                <!-- 상담 카드가 동적으로 추가됨 -->
+                <div class="no-data">상담 데이터를 불러오는 중...</div>
             </div>
         </div>
     </div>
 
     <script src="/socket.io/socket.io.js"></script>
-    <script src="dashboard.js"></script>
+    <script>
+        class DashboardManager {
+            constructor() {
+                this.socket = null;
+                this.consultations = new Map();
+                this.activeTeam = 'all';
+            }
+
+            init() {
+                this.connectWebSocket();
+                this.setupEventListeners();
+                this.updateClock();
+                setInterval(() => this.updateWaitTimes(), 30000);
+            }
+
+            connectWebSocket() {
+                this.socket = io({
+                    transports: ['websocket', 'polling'],
+                    reconnection: true,
+                    reconnectionAttempts: 10,
+                    reconnectionDelay: 1000
+                });
+
+                this.socket.on('connect', () => {
+                    console.log('Connected to server');
+                    this.updateConnectionStatus('연결됨', '#10b981');
+                    this.socket.emit('join:dashboard');
+                });
+
+                this.socket.on('disconnect', () => {
+                    this.updateConnectionStatus('연결 끊김', '#ef4444');
+                });
+
+                this.socket.on('dashboard:init', (data) => {
+                    console.log('Initial data:', data);
+                    this.handleInitialData(data);
+                });
+
+                this.socket.on('dashboard:update', (data) => {
+                    console.log('Update data:', data);
+                    this.handleUpdate(data);
+                });
+
+                this.socket.on('consultation:new', (consultation) => {
+                    this.addConsultation(consultation);
+                });
+
+                this.socket.on('consultation:updated', (consultation) => {
+                    this.updateConsultation(consultation);
+                });
+            }
+
+            updateConnectionStatus(text, color) {
+                document.getElementById('connection-text').textContent = text;
+                document.querySelector('.status-indicator').style.background = color;
+            }
+
+            handleInitialData(consultations) {
+                this.consultations.clear();
+                consultations.forEach(c => {
+                    this.consultations.set(c.id, c);
+                });
+                this.renderConsultations();
+            }
+
+            handleUpdate(consultations) {
+                this.consultations.clear();
+                consultations.forEach(c => {
+                    this.consultations.set(c.id, c);
+                });
+                this.renderConsultations();
+            }
+
+            addConsultation(consultation) {
+                this.consultations.set(consultation.id, consultation);
+                this.renderConsultations();
+            }
+
+            updateConsultation(consultation) {
+                if (this.consultations.has(consultation.id)) {
+                    const existing = this.consultations.get(consultation.id);
+                    this.consultations.set(consultation.id, { ...existing, ...consultation });
+                    this.renderConsultations();
+                }
+            }
+
+            renderConsultations() {
+                const grid = document.getElementById('consultations-grid');
+                const filtered = this.filterAndSortConsultations();
+                
+                grid.innerHTML = '';
+                
+                if (filtered.length === 0) {
+                    grid.innerHTML = '<div class="no-data">현재 미답변 상담이 없습니다</div>';
+                    document.getElementById('total-count').textContent = '총 0건';
+                    return;
+                }
+                
+                filtered.forEach(consultation => {
+                    const card = this.createConsultationCard(consultation);
+                    grid.appendChild(card);
+                });
+                
+                document.getElementById('total-count').textContent = `총 ${filtered.length}건`;
+            }
+
+            filterAndSortConsultations() {
+                let consultations = Array.from(this.consultations.values());
+                
+                // 필터링
+                if (this.activeTeam !== 'all') {
+                    consultations = consultations.filter(c => c.team === this.activeTeam);
+                }
+                
+                // 정렬: 대기시간 내림차순 -> 고객명 내림차순
+                consultations.sort((a, b) => {
+                    const waitTimeDiff = parseInt(b.waitTime) - parseInt(a.waitTime);
+                    if (waitTimeDiff !== 0) return waitTimeDiff;
+                    return b.customerName.localeCompare(a.customerName, 'ko');
+                });
+                
+                return consultations;
+            }
+
+            createConsultationCard(consultation) {
+                const card = document.createElement('div');
+                const teamClass = consultation.team ? `team-${consultation.team.replace(/\s/g, '')}` : '';
+                card.className = `consultation-card ${teamClass}`;
+                card.dataset.consultationId = consultation.id;
+                
+                const waitTime = parseInt(consultation.waitTime) || 0;
+                const waitTimeClass = this.getWaitTimeClass(waitTime);
+                const waitTimeText = this.formatWaitTime(waitTime);
+                
+                card.innerHTML = `
+                    <div class="consultation-header">
+                        <div class="customer-name">${this.escapeHtml(consultation.customerName || '익명')}</div>
+                        <span class="wait-time-indicator ${waitTimeClass}">${waitTimeText}</span>
+                    </div>
+                    <div class="consultation-details">
+                        <p><span class="detail-label">팀</span><span class="detail-value">${this.escapeHtml(consultation.team || '없음')}</span></p>
+                        <p><span class="detail-label">담당자</span><span class="detail-value">${this.escapeHtml(consultation.counselor || '미배정')}</span></p>
+                        <p><span class="detail-label">접수</span><span class="detail-value">${this.formatTime(consultation.createdAt)}</span></p>
+                    </div>
+                    ${consultation.customerMessage ? `
+                        <div class="customer-message">
+                            ${this.escapeHtml(consultation.customerMessage)}
+                        </div>
+                    ` : ''}
+                `;
+                
+                card.addEventListener('dblclick', () => {
+                    if (consultation.chatUrl) {
+                        window.open(consultation.chatUrl, '_blank');
+                    }
+                });
+                
+                return card;
+            }
+
+            getWaitTimeClass(minutes) {
+                if (minutes < 3) return 'wait-time-green';
+                if (minutes <= 4) return 'wait-time-blue';
+                if (minutes <= 6) return 'wait-time-yellow';
+                if (minutes <= 10) return 'wait-time-orange';
+                return 'wait-time-red';
+            }
+
+            formatWaitTime(minutes) {
+                const m = parseInt(minutes) || 0;
+                if (m < 60) return `${m}분`;
+                const hours = Math.floor(m / 60);
+                const mins = m % 60;
+                return `${hours}시간 ${mins}분`;
+            }
+
+            formatTime(timestamp) {
+                const date = new Date(parseInt(timestamp));
+                if (isNaN(date.getTime())) {
+                    return '시간 정보 없음';
+                }
+                return date.toLocaleTimeString('ko-KR', { 
+                    hour: '2-digit', 
+                    minute: '2-digit' 
+                });
+            }
+
+            escapeHtml(text) {
+                const div = document.createElement('div');
+                div.textContent = text || '';
+                return div.innerHTML;
+            }
+
+            setupEventListeners() {
+                document.querySelectorAll('.team-filter-btn').forEach(btn => {
+                    btn.addEventListener('click', (e) => {
+                        document.querySelectorAll('.team-filter-btn').forEach(b => 
+                            b.classList.remove('active')
+                        );
+                        e.target.classList.add('active');
+                        this.activeTeam = e.target.dataset.team;
+                        this.renderConsultations();
+                    });
+                });
+            }
+
+            updateClock() {
+                const updateTime = () => {
+                    const now = new Date();
+                    document.getElementById('current-time').textContent = 
+                        now.toLocaleTimeString('ko-KR');
+                };
+                
+                updateTime();
+                setInterval(updateTime, 1000);
+            }
+
+            updateWaitTimes() {
+                this.consultations.forEach((consultation, id) => {
+                    const waitTime = Math.floor((Date.now() - parseInt(consultation.frontUpdatedAt)) / 60000);
+                    consultation.waitTime = waitTime;
+                });
+                this.renderConsultations();
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            const dashboard = new DashboardManager();
+            dashboard.init();
+        });
+    </script>
 </body>
 </html>

@@ -85,11 +85,16 @@ server.listen(PORT, async () => {
   // 초기화
   await channelHandler.initialize();
   
-  // 5분마다 상태 재확인 (Webhook 놓친 경우 대비)
+  // 1분마다 상태 재확인 (Webhook 놓친 경우 대비)
   setInterval(async () => {
     console.log('🔄 Running periodic cleanup...');
     await channelHandler.cleanupAnsweredChats();
-  }, 300000); // 5분
+  }, 60000); // 1분
+  
+  // 30초마다 대기시간만 업데이트
+  setInterval(async () => {
+    await channelHandler.updateWaitTimes();
+  }, 30000); // 30초
 });
 
 // Graceful shutdown

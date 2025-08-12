@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>채널톡 실시간 상담 모니터링</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="dashboard-container">
+        <header class="dashboard-header">
+            <h1 class="dashboard-title">실시간 상담 모니터링</h1>
+            <div class="header-info">
+                <div class="connection-status">
+                    <span class="status-indicator"></span>
+                    <span id="connection-text">연결중...</span>
+                </div>
+                <span id="total-count">총 0건</span>
+                <span id="current-time"></span>
+            </div>
+        </header>
+
+        <div class="dashboard-content">
+            <div class="team-filter">
+                <button class="team-filter-btn active" data-team="all">전체</button>
+                <button class="team-filter-btn" data-team="SNS 1팀">SNS 1팀</button>
+                <button class="team-filter-btn" data-team="SNS 2팀">SNS 2팀</button>
+                <button class="team-filter-btn" data-team="SNS 3팀">SNS 3팀</button>
+                <button class="team-filter-btn" data-team="SNS 4팀">SNS 4팀</button>
+                <button class="team-filter-btn" data-team="의정부 SNS팀">의정부 SNS팀</button>
+            </div>
+
+            <div id="consultations-grid" class="dashboard-grid">
+                <!-- 상담 카드가 동적으로 추가됨 -->
+            </div>
+        </div>
+    </div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="dashboard.js"></script>
+</body>
+</html>

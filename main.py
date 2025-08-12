@@ -109,56 +109,75 @@ class ChannelAPI:
     async def get_unanswered(self) -> List[Dict]:
         """미답변 상담 조회"""
         try:
-            # 열린 상담 조회
+            # 열린 상담 조회 - 심플하게
             response = await self.client.get(
                 f"{CHANNEL_API_BASE}/user-chats",
                 headers=self.headers,
                 params={
                     "state": "opened",
-                    "limit": 500,
-                    "sortOrder": "-updatedAt"
+                    "limit": 100
+                    # sort 파라미터 제거 - 기본값 사용
                 }
             )
             
+            logger.info(f"API 응답: {response.status_code}")
+            
             if response.status_code != 200:
+                logger.error(f"API 에러 상세: {response.text}")
                 return []
             
-            chats = response.json().get("userChats", [])
+            data = response.json()
+            chats = data.get("userChats", [])
+            logger.info(f"열린 상담 {len(chats)}개 발견")
+            
             unanswered = []
             
             # 매니저 정보 가져오기
             managers = await self.get_managers()
             
             for chat in chats:
-                chat_id = chat.get("id")
-                
-                # 마지막 메시지 확인
-                msg_response = await self.client.get(
-                    f"{CHANNEL_API_BASE}/user-chats/{chat_id}/messages",
-                    headers=self.headers,
-                    params={"limit": 1, "sortOrder": "-createdAt"}
-                )
-                
-                if msg_response.status_code == 200:
-                    messages = msg_response.json().get("messages", [])
-                    if messages and messages[0].get("personType") == "user":
-                        # 담당자 정보
-                        assignee = chat.get("assignee", {})
-                        manager_id = assignee.get("id", "")
-                        manager_info = managers.get(manager_id, {})
+                try:
+                    chat_id = chat.get("id")
+                    
+                    # 마지막 메시지 확인
+                    msg_response = await self.client.get(
+                        f"{CHANNEL_API_BASE}/user-chats/{chat_id}/messages",
+                        headers=self.headers,
+                        params={"limit": 1}  # 가장 최근 메시지만
+                    )
+                    
+                    if msg_response.status_code == 200:
+                        msg_data = msg_response.json()
+                        messages = msg_data.get("messages", [])
                         
-                        unanswered.append({
-                            "id": chat_id,
-                            "team": manager_info.get("team", "미배정"),
-                            "manager": manager_info.get("name", assignee.get("name", "미배정")),
-                            "last_message": messages[0].get("message", ""),
-                            "last_message_time": messages[0].get("createdAt", "")
-                        })
+                        if messages:
+                            last_msg = messages[0]
+                            # 마지막 메시지가 고객 메시지인지 확인
+                            if last_msg.get("personType") == "user":
+                                # 담당자 정보
+                                assignee = chat.get("assignee", {})
+                                manager_id = assignee.get("id", "")
+                                manager_info = managers.get(manager_id, {})
+                                
+                                unanswered.append({
+                                    "id": chat_id,
+                                    "team": manager_info.get("team", "미배정"),
+                                    "manager": manager_info.get("name", assignee.get("name", "미배정")),
+                                    "last_message": last_msg.get("message", ""),
+                                    "last_message_time": last_msg.get("createdAt", "")
+                                })
+                                logger.info(f"미답변 추가: {chat_id}")
+                except Exception as e:
+                    logger.error(f"상담 {chat_id} 처리 실패: {e}")
+                    continue
             
+            logger.info(f"✅ 미답변 조회 성공: {len(unanswered)}개")
             return unanswered
             
         except Exception as e:
             logger.error(f"미답변 조회 실패: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return []
 
 class Manager:
@@ -206,26 +225,89 @@ class Manager:
         """웹훅 처리"""
         try:
             event_type = data.get("type")
+            logger.info(f"웹훅 이벤트: {event_type}")
             
             if event_type == "message":
                 message = data.get("message", {})
                 chat_id = message.get("chatId")
                 person_type = message.get("personType")
                 
+                logger.info(f"메시지 웹훅: chatId={chat_id}, personType={person_type}")
+                
                 if person_type == "user":
                     # 고객 메시지 - 미답변 추가
-                    await self.add_unanswered(chat_id)
+                    # 개별 상담만 업데이트
+                    await self.update_single_chat(chat_id)
                 elif person_type == "manager":
                     # 상담사 응답 - 제거
                     await self.remove_consultation(chat_id)
                     
+            elif event_type == "userChat":
+                chat = data.get("userChat", {})
+                chat_id = chat.get("id")
+                logger.info(f"새 상담: {chat_id}")
+                await self.update_single_chat(chat_id)
+                
         except Exception as e:
             logger.error(f"웹훅 처리 실패: {e}")
     
-    async def add_unanswered(self, chat_id: str):
-        """미답변 추가"""
-        # API에서 상세 정보 가져와서 추가
-        await self.sync()  # 간단하게 전체 동기화
+    async def update_single_chat(self, chat_id: str):
+        """단일 상담 업데이트"""
+        try:
+            # 해당 상담 정보만 가져오기
+            response = await self.api.client.get(
+                f"{CHANNEL_API_BASE}/user-chats/{chat_id}",
+                headers=self.api.headers
+            )
+            
+            if response.status_code != 200:
+                return
+            
+            chat = response.json().get("userChat", {})
+            
+            # 마지막 메시지 확인
+            msg_response = await self.api.client.get(
+                f"{CHANNEL_API_BASE}/user-chats/{chat_id}/messages",
+                headers=self.api.headers,
+                params={"limit": 1}
+            )
+            
+            if msg_response.status_code == 200:
+                messages = msg_response.json().get("messages", [])
+                if messages and messages[0].get("personType") == "user":
+                    # 미답변 상담으로 추가
+                    await self.add_single_unanswered(chat_id, chat, messages[0])
+                    
+        except Exception as e:
+            logger.error(f"단일 상담 업데이트 실패: {e}")
+    
+    async def add_single_unanswered(self, chat_id: str, chat: Dict, last_message: Dict):
+        """단일 미답변 추가"""
+        try:
+            managers = await self.api.get_managers()
+            assignee = chat.get("assignee", {})
+            manager_id = assignee.get("id", "")
+            manager_info = managers.get(manager_id, {})
+            
+            msg_time = datetime.fromisoformat(last_message.get("createdAt", "").replace("Z", "+00:00"))
+            wait_minutes = int((datetime.now(timezone.utc) - msg_time).total_seconds() / 60)
+            
+            consultation = Consultation(
+                id=chat_id,
+                team=manager_info.get("team", "미배정"),
+                manager=manager_info.get("name", assignee.get("name", "미배정")),
+                last_message=last_message.get("message", ""),
+                wait_minutes=wait_minutes,
+                last_message_time=msg_time
+            )
+            
+            await self.redis.hset("consultations", chat_id, consultation.json())
+            logger.info(f"✅ 미답변 추가: {chat_id}")
+            
+            await self.broadcast_update()
+            
+        except Exception as e:
+            logger.error(f"미답변 추가 실패: {e}")
     
     async def remove_consultation(self, chat_id: str):
         """상담 제거"""
@@ -356,6 +438,38 @@ async def health():
         return {"status": "ok"}
     except:
         raise HTTPException(status_code=503)
+
+@app.get("/debug/test-api")
+async def test_api():
+    """API 연결 테스트"""
+    try:
+        # 열린 상담 테스트
+        response = await api_client.client.get(
+            f"{CHANNEL_API_BASE}/user-chats",
+            headers=api_client.headers,
+            params={"state": "opened", "limit": 10}
+        )
+        
+        return {
+            "status_code": response.status_code,
+            "headers_sent": api_client.headers,
+            "response": response.json() if response.status_code == 200 else response.text
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/debug/sync")
+async def force_sync():
+    """강제 동기화 및 결과 확인"""
+    try:
+        await manager.sync()
+        consultations = await manager.get_all()
+        return {
+            "count": len(consultations),
+            "consultations": consultations
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 @app.get("/")
 async def index():
@@ -688,5 +802,5 @@ async def index():
     return HTMLResponse(content=html_content)
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, workers=2)
+    port = int(os.environ.get("PORT", 10000))  # Render는 10000 포트 사용
+    uvicorn.run("main:app", host="0.0.0.0", port=port, workers=1)  # workers 1로 줄임

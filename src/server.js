@@ -32,6 +32,37 @@ let channelService;
 
 async function initialize() {
   try {
+    // ⭐️ 1. 먼저 서버 시작 (포트 열기)
+    server.listen(PORT, HOST, () => {
+      console.log(`✅ Server running on http://${HOST}:${PORT}`);
+    });
+
+    // 2. Health check 엔드포인트 즉시 활성화
+    app.get('/health', (req, res) => {
+      res.status(200).json({ 
+        status: 'OK', 
+        timestamp: new Date().toISOString(),
+        redis: redisClient ? 'connected' : 'initializing'
+      });
+    });
+
+    // 3. API 엔드포인트 즉시 활성화  
+    app.get('/api/consultations', async (req, res) => {
+      if (!channelService) {
+        res.json([]);
+        return;
+      }
+      try {
+        const consultations = await channelService.getUnansweredConsultations();
+        res.json(consultations);
+      } catch (error) {
+        res.status(500).json({ error: error.message });
+      }
+    });
+
+    // 4. 이제 Redis와 채널톡 초기화
+    console.log('Server port opened, initializing services...');
+    
     // Redis 연결
     console.log('Connecting to Redis...');
     redisClient = await initializeRedis();
@@ -44,26 +75,22 @@ async function initialize() {
     console.log('Setting up webhooks...');
     setupWebhook(app, redisClient, io, channelService);
     
-    // ⭐️ 서버 먼저 시작 (포트 열기)
-    server.listen(PORT, HOST, () => {
-      console.log(`✅ Server running on http://${HOST}:${PORT}`);
-      
-      // ⭐️ 서버 시작 후에 초기 데이터 로드
-      console.log('Server started, now loading initial data in background...');
-      loadInitialDataInBackground();
-    });
-    
     // WebSocket 연결 처리
     io.on('connection', (socket) => {
       console.log('Client connected:', socket.id);
       
       socket.on('join:dashboard', async () => {
         socket.join('dashboard');
+        if (!channelService) {
+          socket.emit('dashboard:init', []);
+          return;
+        }
         try {
           const currentData = await channelService.getUnansweredConsultations();
           socket.emit('dashboard:init', currentData);
         } catch (error) {
           console.error('Error sending initial data:', error);
+          socket.emit('dashboard:init', []);
         }
       });
       
@@ -72,34 +99,10 @@ async function initialize() {
       });
     });
     
-    // Health check
-    app.get('/health', async (req, res) => {
-      try {
-        if (redisClient) {
-          await redisClient.ping();
-        }
-        res.status(200).json({ 
-          status: 'OK', 
-          timestamp: new Date().toISOString(),
-          redis: redisClient ? 'connected' : 'disconnected'
-        });
-      } catch (error) {
-        res.status(503).json({ 
-          status: 'ERROR', 
-          error: error.message 
-        });
-      }
-    });
-    
-    // API 엔드포인트 추가
-    app.get('/api/consultations', async (req, res) => {
-      try {
-        const consultations = await channelService.getUnansweredConsultations();
-        res.json(consultations);
-      } catch (error) {
-        res.status(500).json({ error: error.message });
-      }
-    });
+    // 5. 백그라운드에서 데이터 로드
+    setTimeout(() => {
+      loadInitialDataInBackground();
+    }, 1000); // 1초 후 시작
     
   } catch (error) {
     console.error('Initialization error:', error);
@@ -118,14 +121,18 @@ async function loadInitialDataInBackground() {
     
     // 30초마다 동기화
     setInterval(() => {
-      channelService.syncOpenChats().catch(console.error);
+      if (channelService) {
+        channelService.syncOpenChats().catch(console.error);
+      }
     }, 30000);
     
-    // 5분 후에 첫 전체 스캔 실행
+    // 10분 후에 첫 전체 스캔 실행
     setTimeout(() => {
-      console.log('Starting first full scan...');
-      channelService.syncOpenChats().catch(console.error);
-    }, 300000); // 5분
+      console.log('Starting first full scan in background...');
+      if (channelService) {
+        channelService.syncOpenChats().catch(console.error);
+      }
+    }, 600000); // 10분
     
   } catch (error) {
     console.error('Background data load error:', error);
@@ -135,6 +142,16 @@ async function loadInitialDataInBackground() {
 // 우아한 종료
 process.on('SIGTERM', async () => {
   console.log('SIGTERM received, shutting down...');
+  server.close(async () => {
+    if (redisClient) {
+      await redisClient.quit();
+    }
+    process.exit(0);
+  });
+});
+
+process.on('SIGINT', async () => {
+  console.log('SIGINT received, shutting down...');
   server.close(async () => {
     if (redisClient) {
       await redisClient.quit();

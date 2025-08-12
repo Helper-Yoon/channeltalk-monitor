@@ -26,9 +26,9 @@
             --accent: #3b82f6;
             --team1: #86efac;
             --team2: #93c5fd;
-            --team3: #fde047;
+            --team3: #ffd700;
             --team4: #fca5a5;
-            --team5: #c084fc;
+            --team5: #1e40af;
         }
 
         body {
@@ -202,7 +202,7 @@
 
         .table-header {
             display: grid;
-            grid-template-columns: 60px 120px 1fr 120px 120px 100px 140px 100px;
+            grid-template-columns: 60px 120px 1fr 150px 150px;
             padding: 0.875rem 1rem;
             background: rgba(0, 0, 0, 0.5);
             border-bottom: 1px solid var(--border);
@@ -215,7 +215,7 @@
 
         .table-row {
             display: grid;
-            grid-template-columns: 60px 120px 1fr 120px 120px 100px 140px 100px;
+            grid-template-columns: 60px 120px 1fr 150px 150px;
             padding: 0.875rem 1rem;
             border-bottom: 1px solid rgba(34, 34, 34, 0.5);
             align-items: center;
@@ -358,7 +358,7 @@
         }
 
         .team-SNS3 {
-            background: rgba(253, 224, 71, 0.1);
+            background: rgba(255, 215, 0, 0.1);
             border-color: var(--team3);
             color: var(--team3);
         }
@@ -370,7 +370,7 @@
         }
 
         .team-의정부 {
-            background: rgba(192, 132, 252, 0.1);
+            background: rgba(30, 64, 175, 0.1);
             border-color: var(--team5);
             color: var(--team5);
         }
@@ -498,11 +498,7 @@
         @media (max-width: 1200px) {
             .table-header,
             .table-row {
-                grid-template-columns: 50px 100px 1fr 100px 100px 120px 80px;
-            }
-            
-            .status-badge {
-                display: none;
+                grid-template-columns: 50px 100px 1fr 120px 120px;
             }
         }
 
@@ -566,9 +562,6 @@
                 <div>고객명 / 메시지</div>
                 <div>팀</div>
                 <div>담당자</div>
-                <div>상태</div>
-                <div>접수시간</div>
-                <div>처리</div>
             </div>
             <div id="table-body">
                 <!-- 동적으로 생성 -->
@@ -591,6 +584,7 @@
                 this.consultations = new Map();
                 this.activeTeam = 'all';
                 this.socket = null;
+                this.lastCriticalCount = 0;
             }
 
             init() {
@@ -627,7 +621,6 @@
 
                 this.socket.on('consultation:new', (consultation) => {
                     this.addConsultation(consultation);
-                    this.showToast('새 상담 접수', `${consultation.customerName}님의 상담이 접수되었습니다`);
                 });
             }
 
@@ -640,16 +633,10 @@
             }
 
             handleUpdate(consultations) {
-                const prevSize = this.consultations.size;
                 this.consultations.clear();
                 consultations.forEach(c => {
                     this.consultations.set(c.id, c);
                 });
-                
-                if (this.consultations.size > prevSize) {
-                    this.showToast('긴급 알림', '새로운 미답변 상담이 있습니다');
-                }
-                
                 this.render();
             }
 
@@ -675,10 +662,24 @@
 
                 container.innerHTML = filtered.map(c => this.createRow(c)).join('');
                 
+                // 더블클릭 이벤트 추가
+                container.querySelectorAll('.table-row').forEach(row => {
+                    row.addEventListener('dblclick', (e) => {
+                        const url = row.dataset.url;
+                        if (url) window.open(url, '_blank');
+                    });
+                });
+                
                 // 통계 업데이트
                 const critical = filtered.filter(c => parseInt(c.waitTime) >= 10).length;
                 const avgWait = Math.round(filtered.reduce((sum, c) => sum + parseInt(c.waitTime || 0), 0) / filtered.length);
                 this.updateStats(filtered.length, critical, avgWait);
+                
+                // 10분 이상 대기 상담 알림
+                if (critical > 0 && critical > this.lastCriticalCount) {
+                    this.showToast('⚠️ 긴급', `${critical}건의 상담이 10분 이상 대기 중입니다`);
+                }
+                this.lastCriticalCount = critical;
             }
 
             createRow(consultation) {
@@ -687,7 +688,7 @@
                 const teamClass = this.getTeamClass(consultation.team);
                 
                 return `
-                    <div class="table-row priority-${priority}" data-id="${consultation.id}">
+                    <div class="table-row priority-${priority}" data-id="${consultation.id}" data-url="${consultation.chatUrl}">
                         <div class="priority">
                             <div class="priority-indicator">${this.getPriorityIcon(waitTime)}</div>
                         </div>
@@ -705,16 +706,7 @@
                         <div>
                             <span class="team-badge ${teamClass}">${consultation.team || '미배정'}</span>
                         </div>
-                        <div class="counselor">${consultation.counselor || '미배정'}</div>
-                        <div>
-                            <span class="status-badge status-waiting">대기중</span>
-                        </div>
-                        <div class="time-info">${this.formatTime(consultation.createdAt)}</div>
-                        <div>
-                            <button class="action-btn" onclick="window.open('${consultation.chatUrl}', '_blank')">
-                                처리 →
-                            </button>
-                        </div>
+                        <div class="counselor">${consultation.counselor || '-'}</div>
                     </div>
                 `;
             }
@@ -788,10 +780,6 @@
                 
                 toast.classList.add('show');
                 setTimeout(() => toast.classList.remove('show'), 5000);
-                
-                // 소리 알림
-                const audio = new Audio('data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhBSx9zPLTgjMGHm7A7+OZURE');
-                audio.play().catch(e => console.log('Audio failed:', e));
             }
 
             setupEventListeners() {

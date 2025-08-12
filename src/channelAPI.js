@@ -1,557 +1,406 @@
-// src/channelAPI.js - 완전 최적화 버전
-import fetch from 'node-fetch';
+const axios = require('axios');
+const { createClient } = require('redis');
+const TeamManager = require('./teamManager');
 
-export class ChannelTalkService {
-  constructor(redisClient, io) {
-    this.redis = redisClient;
+class ChannelHandler {
+  constructor(io) {
     this.io = io;
-    this.apiKey = process.env.CHANNEL_API_KEY || '688a26176fcb19aebf8b';
-    this.apiSecret = process.env.CHANNEL_API_SECRET || 'a0db6c38b95c8ec4d9bb46e7c653b3e2';
-    this.baseURL = 'https://api.channel.io/open/v5';
-    this.managers = {}; // 매니저 정보 캐시
-    this.processedChats = new Set(); // 이미 처리한 채팅 ID 저장
-    this.apiCallCount = 0; // API 호출 횟수 추적
-    this.lastSyncTime = 0; // 마지막 동기화 시간
-    this.lastManagerLoad = 0; // 매니저 마지막 로드 시간
-    this.lastFullScan = 0; // 마지막 전체 스캔 시간
-    this.isProcessing = false; // 현재 처리 중인지 확인
+    this.apiKey = process.env.CHANNEL_API_KEY;
+    this.apiSecret = process.env.CHANNEL_API_SECRET;
+    this.channelId = process.env.CHANNEL_ID;
+    this.teamManager = new TeamManager();
     
-    // 팀별 담당자 매핑
-    this.teamMembers = {
-      'SNS 1팀': ['이종민', '정주연', '이혜영', '김국현', '정다혜', '조시현', '김시윤'],
-      'SNS 2팀': ['윤도우리', '신혜서', '김상아', '박은진', '오민환', '서정국'],
-      'SNS 3팀': ['김진후', '김시진', '권재현', '김지원', '최호익', '김진협', '박해영'],
-      'SNS 4팀': ['이민주', '전지윤', '전미란', '김채영', '김영진', '강헌준'],
-      '의정부 SNS팀': ['차정환', '최수능', '구본영', '서민국', '오민경', '김범주', '동수진', '성일훈', '손진우'],
-      '기타': ['채주은', '강형욱']
-    };
+    // Redis 클라이언트
+    this.redis = null;
+    this.connectRedis();
+    
+    // 캐시
+    this.managers = {};
+    this.lastManagerLoad = 0;
   }
 
-  // API 호출에 딜레이 추가 (Rate Limit 방지)
-  async delay(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-  }
-
-  async makeRequest(endpoint, options = {}) {
-    // Rate limit 방지: API 호출 간 500ms 딜레이로 증가
-    await this.delay(500);
-    
-    this.apiCallCount++;
-    
-    const url = `${this.baseURL}${endpoint}`;
-    const headers = {
-      'x-access-key': this.apiKey,
-      'x-access-secret': this.apiSecret,
-      'accept': 'application/json',
-      ...options.headers
-    };
-
+  async connectRedis() {
     try {
-      const response = await fetch(url, { 
-        ...options, 
-        headers,
-        timeout: 10000 
+      this.redis = createClient({
+        url: process.env.REDIS_URL
       });
       
-      if (response.status === 429) {
-        // Rate limit 도달시 30초 대기 후 재시도
-        console.warn('Rate limit reached, waiting 30 seconds...');
-        await this.delay(30000);
-        return this.makeRequest(endpoint, options);
-      }
+      this.redis.on('error', (err) => console.error('Redis error:', err));
+      this.redis.on('connect', () => console.log('✅ Redis connected'));
       
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error(`API Error: ${response.status} - ${errorText}`);
-        throw new Error(`HTTP ${response.status}`);
-      }
-      
-      return await response.json();
+      await this.redis.connect();
     } catch (error) {
-      console.error('Channel API request failed:', error);
+      console.error('Failed to connect Redis:', error);
+    }
+  }
+
+  isRedisConnected() {
+    return this.redis && this.redis.isReady;
+  }
+
+  async initialize() {
+    console.log('🔧 Initializing Channel Handler...');
+    
+    // 1. 매니저 정보 로드 (캐싱)
+    await this.loadManagers();
+    
+    // 2. 초기 미답변 상담 로드 (최소한의 API 호출)
+    await this.loadInitialConsultations();
+    
+    console.log('✅ Initialization complete');
+  }
+
+  // API 호출 헬퍼
+  async makeRequest(endpoint, options = {}) {
+    try {
+      const response = await axios({
+        method: options.method || 'GET',
+        url: `https://api.channel.io/open/v5${endpoint}`,
+        headers: {
+          'X-Access-Key': this.apiKey,
+          'X-Access-Secret': this.apiSecret,
+          'Content-Type': 'application/json'
+        },
+        data: options.data,
+        timeout: 10000
+      });
+      return response.data;
+    } catch (error) {
+      console.error(`API Error [${endpoint}]:`, error.message);
       throw error;
     }
   }
 
+  // 매니저 정보 로드 (1시간마다 갱신)
   async loadManagers() {
     try {
-      this.managers = {};
+      const now = Date.now();
+      if (this.managers && Object.keys(this.managers).length > 0 && 
+          now - this.lastManagerLoad < 3600000) {
+        return;
+      }
+
+      console.log('📥 Loading managers...');
       let offset = 0;
-      let totalManagers = 0;
-      let hasMore = true;
+      let managers = {};
       
-      console.log('Loading ALL managers from Channel Talk...');
-      
-      while (hasMore) {
-        try {
-          const endpoint = `/managers?limit=500&offset=${offset}`;
-          const data = await this.makeRequest(endpoint);
-          
-          if (data.managers && data.managers.length > 0) {
-            data.managers.forEach(manager => {
-              this.managers[manager.id] = {
-                id: manager.id,
-                name: manager.name || manager.displayName || manager.email || 'Unknown',
-                displayName: manager.displayName,
-                email: manager.email
-              };
-              totalManagers++;
-            });
-            
-            console.log(`Loaded ${data.managers.length} managers (total: ${totalManagers})`);
-            
-            if (data.managers.length < 500) {
-              hasMore = false;
-            } else {
-              offset += 500;
-            }
-          } else {
-            hasMore = false;
-          }
-        } catch (error) {
-          console.error(`Error loading managers at offset ${offset}:`, error);
-          hasMore = false;
-        }
+      while (true) {
+        const data = await this.makeRequest(`/managers?limit=100&offset=${offset}`);
+        if (!data.managers || data.managers.length === 0) break;
+        
+        data.managers.forEach(m => {
+          managers[m.id] = {
+            id: m.id,
+            name: m.displayName || m.name,
+            email: m.email
+          };
+        });
+        
+        if (data.managers.length < 100) break;
+        offset += 100;
       }
       
-      console.log(`✅ Total managers loaded: ${totalManagers}`);
+      this.managers = managers;
+      this.lastManagerLoad = now;
       
+      // Redis에 캐싱
+      await this.redis.hSet('cache:managers', 
+        Object.entries(managers).map(([k, v]) => [k, JSON.stringify(v)]).flat()
+      );
+      await this.redis.expire('cache:managers', 3600);
+      
+      console.log(`✅ Loaded ${Object.keys(managers).length} managers`);
     } catch (error) {
       console.error('Failed to load managers:', error);
     }
   }
 
-  findTeamByName(name) {
-    if (!name || name === '미배정') return '없음';
-    
-    const fullName = String(name).trim();
-    
-    for (const [team, members] of Object.entries(this.teamMembers)) {
-      if (members.includes(fullName)) {
-        return team;
-      }
-    }
-    
-    for (const [team, members] of Object.entries(this.teamMembers)) {
-      for (const member of members) {
-        if (fullName.includes(member) || member.includes(fullName)) {
-          return team;
-        }
-      }
-    }
-    
-    return '기타';
-  }
-
-  // 빠른 초기 동기화 (최근 200개만)
-  async quickSync() {
-    if (this.isProcessing) {
-      console.log('Already processing, skipping quick sync');
-      return;
-    }
-
+  // 초기 미답변 상담 로드 (서버 시작 시 1회)
+  async loadInitialConsultations() {
     try {
-      this.isProcessing = true;
-      console.log('=== Quick sync starting ===');
-      this.apiCallCount = 0;
+      console.log('📥 Loading initial consultations...');
       
-      // 매니저 정보 로드
-      if (Object.keys(this.managers).length === 0) {
-        await this.loadManagers();
-      }
-      
-      // 최근 200개만 빠르게 가져오기
-      const data = await this.makeRequest('/user-chats?state=opened&limit=200&sortOrder=desc');
+      // 최근 500개만 빠르게 스캔
+      const data = await this.makeRequest('/user-chats?state=opened&limit=500&sortOrder=desc');
       const userChats = data.userChats || [];
       
-      console.log(`Quick sync: Found ${userChats.length} recent chats`);
+      let unansweredCount = 0;
       
-      // 미답변 상담만 빠르게 처리
-      const unansweredChats = [];
-      const batchSize = 5;
-      
-      for (let i = 0; i < userChats.length; i += batchSize) {
-        const batch = userChats.slice(i, i + batchSize);
+      // 배치 처리 (10개씩)
+      for (let i = 0; i < userChats.length; i += 10) {
+        const batch = userChats.slice(i, i + 10);
         
         await Promise.all(batch.map(async (chat) => {
           try {
-            const messagesData = await this.makeRequest(`/user-chats/${chat.id}/messages?sortOrder=desc&limit=3`);
+            // 최근 메시지 확인
+            const messagesData = await this.makeRequest(
+              `/user-chats/${chat.id}/messages?limit=2&sortOrder=desc`
+            );
             const messages = messagesData.messages || [];
             
-            const lastCustomerMessage = messages.find(m => m.personType === 'user');
-            const lastManagerMessage = messages.find(m => m.personType === 'manager');
-            
-            if (lastCustomerMessage && (!lastManagerMessage || lastCustomerMessage.createdAt > lastManagerMessage.createdAt)) {
-              // 채널톡에서 분류 정보 가져오기
-              let category = '';
-              const chatDetail = await this.makeRequest(`/user-chats/${chat.id}`);
-              const fullChat = chatDetail.userChat || chat;
-              
-              // tags에서 스킬_ 정보 찾기
-              if (fullChat.tags && fullChat.tags.length > 0) {
-                const skillTag = fullChat.tags.find(tag => 
-                  typeof tag === 'string' && tag.startsWith('스킬_')
-                );
-                if (skillTag) {
-                  category = skillTag;
-                }
-              }
-              
-              // 담당자 정보
-              let counselorName = '미배정';
-              let teamName = '없음';
-              
-              if (fullChat.assigneeId && this.managers[fullChat.assigneeId]) {
-                const assignee = this.managers[fullChat.assigneeId];
-                counselorName = assignee.name || assignee.displayName || '미배정';
-                teamName = this.findTeamByName(counselorName);
-              }
-              
-              // 고객 정보
-              let customerName = fullChat.name || fullChat.user?.name || fullChat.user?.phoneNumber || '익명';
-              
-              const consultationData = {
-                id: String(chat.id),
-                customerName: String(customerName),
-                customerMessage: String(lastCustomerMessage.plainText || lastCustomerMessage.message || ''),
-                category: String(category || ''),
-                team: String(teamName),
-                counselor: String(counselorName),
-                waitTime: String(this.calculateWaitTime(lastCustomerMessage.createdAt)),
-                createdAt: String(chat.createdAt),
-                frontUpdatedAt: String(lastCustomerMessage.createdAt),
-                chatUrl: `https://desk.channel.io/#/channels/197228/user_chats/${chat.id}`
-              };
-              
-              unansweredChats.push(consultationData);
-              
-              // Redis에 저장
-              const redisData = Object.entries(consultationData)
-                .map(([key, value]) => [key, String(value)])
-                .flat();
-              
-              await this.redis.hSet(`consultation:${chat.id}`, redisData);
-              await this.redis.zAdd('consultations:waiting', {
-                score: lastCustomerMessage.createdAt,
-                value: String(chat.id)
-              });
-              await this.redis.expire(`consultation:${chat.id}`, 86400);
+            if (messages.length > 0 && messages[0].personType === 'user') {
+              // 미답변 상담
+              await this.saveConsultation(chat, messages[0]);
+              unansweredCount++;
             }
           } catch (error) {
-            console.error(`Error in quick sync for chat ${chat.id}:`, error.message);
+            console.error(`Error checking chat ${chat.id}:`, error.message);
           }
         }));
         
-        // 배치 간 딜레이
-        if (i + batchSize < userChats.length) {
-          await this.delay(1000);
+        // Rate limit 방지
+        if (i + 10 < userChats.length) {
+          await new Promise(resolve => setTimeout(resolve, 500));
         }
       }
       
-      console.log(`=== Quick sync complete: ${unansweredChats.length} unanswered chats (${this.apiCallCount} API calls) ===`);
-      
-      // 정렬
-      unansweredChats.sort((a, b) => {
-        const waitTimeDiff = parseInt(b.waitTime || 0) - parseInt(a.waitTime || 0);
-        if (waitTimeDiff !== 0) return waitTimeDiff;
-        
-        const nameA = a.customerName || '익명';
-        const nameB = b.customerName || '익명';
-        return nameB.localeCompare(nameA, 'ko');
-      });
+      console.log(`✅ Found ${unansweredCount} unanswered consultations`);
       
       // 대시보드 업데이트
-      this.io.to('dashboard').emit('dashboard:update', unansweredChats);
-      
-      // 첫 동기화 시간 설정
-      this.lastSyncTime = Date.now();
-      
+      await this.broadcastUpdate();
     } catch (error) {
-      console.error('Quick sync error:', error);
-    } finally {
-      this.isProcessing = false;
+      console.error('Failed to load initial consultations:', error);
     }
   }
 
-  // 전체 동기화
-  async syncOpenChats() {
-    if (this.isProcessing) {
-      console.log('Already processing, skipping sync');
-      return;
-    }
-
+  // Webhook 이벤트 처리 (메인 로직)
+  async handleWebhookEvent(event) {
     try {
-      console.log('=== Starting sync ===');
-      this.apiCallCount = 0;
+      console.log(`🔄 Processing ${event.type} event`);
       
-      // 최소 동기화 간격 설정 (60초)
-      const now = Date.now();
-      if (now - this.lastSyncTime < 60000) {
-        console.log('Skipping sync - too soon');
-        return;
+      switch (event.type) {
+        case 'message':
+          await this.handleMessageEvent(event);
+          break;
+          
+        case 'userChat':
+          await this.handleUserChatEvent(event);
+          break;
+          
+        case 'userChatAssignee':
+          await this.handleAssigneeEvent(event);
+          break;
+          
+        case 'userChatTags':
+          await this.handleTagsEvent(event);
+          break;
+          
+        default:
+          console.log(`Unhandled event type: ${event.type}`);
       }
-      this.lastSyncTime = now;
-      this.isProcessing = true;
-      
-      // 매니저 정보 로드 (최초 또는 1시간마다 갱신)
-      if (Object.keys(this.managers).length === 0 || now - this.lastManagerLoad > 3600000) {
-        this.lastManagerLoad = now;
-        await this.loadManagers();
-      } else {
-        console.log(`Using cached managers (${Object.keys(this.managers).length} managers)`);
-      }
-      
-      // 전체 스캔 여부 결정 (30분마다 전체 스캔)
-      const isFullScan = (now - this.lastFullScan > 1800000) || this.lastFullScan === 0;
-      
-      let allUserChats = [];
-      
-      if (isFullScan) {
-        // 전체 스캔 - 하지만 실제로는 최근 5000개만
-        console.log('🔍 FULL SCAN - Fetching recent 5000 chats...');
-        this.lastFullScan = now;
-        
-        let offset = 0;
-        let hasMore = true;
-        const limit = 500;
-        const maxChats = 5000; // 5000개로 제한
-        
-        while (hasMore && allUserChats.length < maxChats) {
-          try {
-            const data = await this.makeRequest(`/user-chats?state=opened&limit=${limit}&offset=${offset}&sortOrder=desc`);
-            const userChats = data.userChats || [];
-            
-            allUserChats.push(...userChats);
-            console.log(`Fetched batch: ${userChats.length} chats (total: ${allUserChats.length})`);
-            
-            if (userChats.length < limit || allUserChats.length >= maxChats) {
-              hasMore = false;
-            } else {
-              offset += limit;
-            }
-          } catch (error) {
-            console.error(`Error fetching chats at offset ${offset}:`, error);
-            hasMore = false;
-          }
-        }
-      } else {
-        // 빠른 스캔 (최근 200개만)
-        console.log('⚡ QUICK SCAN - Fetching recent 200 chats only...');
-        const data = await this.makeRequest('/user-chats?state=opened&limit=200&sortOrder=desc');
-        allUserChats = data.userChats || [];
-      }
-      
-      console.log(`✅ Total chats to process: ${allUserChats.length}`);
-      
-      // 기존 상담 ID 목록 가져오기
-      const existingIds = await this.redis.zRange('consultations:waiting', 0, -1);
-      const currentIds = new Set(allUserChats.map(chat => String(chat.id)));
-      
-      // 삭제된 상담 제거
-      for (const id of existingIds) {
-        if (!currentIds.has(id)) {
-          await this.redis.del(`consultation:${id}`);
-          await this.redis.zRem('consultations:waiting', id);
-          console.log(`Removed closed chat: ${id}`);
-        }
-      }
-      
-      // 미답변 상담 찾기 (최적화)
-      const unansweredChats = [];
-      const batchSize = 3; // 더 작은 배치
-      let processedCount = 0;
-      let newChatsCount = 0;
-      let skippedCount = 0;
-      
-      console.log('Processing chats for unanswered messages...');
-      
-      for (let i = 0; i < allUserChats.length; i += batchSize) {
-        const batch = allUserChats.slice(i, i + batchSize);
-        
-        await Promise.all(batch.map(async (chat) => {
-          try {
-            processedCount++;
-            
-            // 진행 상황 로그 (200개마다)
-            if (processedCount % 200 === 0) {
-              console.log(`Progress: ${processedCount}/${allUserChats.length} (New: ${newChatsCount}, Skipped: ${skippedCount})`);
-            }
-            
-            // 이미 처리한 채팅은 대기시간만 업데이트
-            const existingData = await this.redis.hGetAll(`consultation:${chat.id}`);
-            if (existingData && Object.keys(existingData).length > 0) {
-              const waitTime = this.calculateWaitTime(parseInt(existingData.frontUpdatedAt));
-              existingData.waitTime = String(waitTime);
-              unansweredChats.push(existingData);
-              skippedCount++;
-              return;
-            }
-            
-            // 새로운 채팅만 상세 정보 조회
-            newChatsCount++;
-            
-            // 메시지만 먼저 확인
-            const messagesData = await this.makeRequest(`/user-chats/${chat.id}/messages?sortOrder=desc&limit=5`);
-            const messages = messagesData.messages || [];
-            
-            const lastCustomerMessage = messages.find(m => m.personType === 'user');
-            const lastManagerMessage = messages.find(m => m.personType === 'manager');
-            
-            if (lastCustomerMessage && (!lastManagerMessage || lastCustomerMessage.createdAt > lastManagerMessage.createdAt)) {
-              // 미답변인 경우만 상세 정보 조회
-              const chatDetail = await this.makeRequest(`/user-chats/${chat.id}`);
-              const fullChat = chatDetail.userChat || chat;
-              
-              // 분류 정보
-              let category = '';
-              if (fullChat.tags && fullChat.tags.length > 0) {
-                const skillTag = fullChat.tags.find(tag => 
-                  typeof tag === 'string' && tag.startsWith('스킬_')
-                );
-                if (skillTag) {
-                  category = skillTag;
-                }
-              }
-              
-              // 담당자 정보
-              let counselorName = '미배정';
-              let teamName = '없음';
-              
-              if (fullChat.assigneeId) {
-                if (this.managers[fullChat.assigneeId]) {
-                  const assignee = this.managers[fullChat.assigneeId];
-                  counselorName = assignee.name || assignee.displayName || '미배정';
-                  teamName = this.findTeamByName(counselorName);
-                } else {
-                  // 캐시에 없으면 개별 조회
-                  try {
-                    const managerData = await this.makeRequest(`/managers/${fullChat.assigneeId}`);
-                    if (managerData.manager) {
-                      const manager = managerData.manager;
-                      counselorName = manager.name || manager.displayName || '미배정';
-                      teamName = this.findTeamByName(counselorName);
-                      
-                      // 캐시에 추가
-                      this.managers[fullChat.assigneeId] = {
-                        id: manager.id,
-                        name: counselorName,
-                        displayName: manager.displayName,
-                        email: manager.email
-                      };
-                    }
-                  } catch (err) {
-                    counselorName = '확인필요';
-                    teamName = '확인필요';
-                  }
-                }
-              }
-              
-              // 고객 정보
-              let customerName = '익명';
-              if (fullChat.user) {
-                customerName = fullChat.user.name || 
-                             fullChat.user.phoneNumber ||
-                             fullChat.user.id ||
-                             '익명';
-              } else {
-                customerName = fullChat.name || chat.name || '익명';
-              }
-              
-              const consultationData = {
-                id: String(chat.id),
-                customerName: String(customerName),
-                customerMessage: String(lastCustomerMessage.plainText || lastCustomerMessage.message || ''),
-                category: String(category || ''),
-                team: String(teamName),
-                counselor: String(counselorName),
-                waitTime: String(this.calculateWaitTime(lastCustomerMessage.createdAt)),
-                createdAt: String(chat.createdAt),
-                frontUpdatedAt: String(lastCustomerMessage.createdAt),
-                chatUrl: `https://desk.channel.io/#/channels/197228/user_chats/${chat.id}`
-              };
-              
-              unansweredChats.push(consultationData);
-              
-              // Redis에 저장
-              const redisData = Object.entries(consultationData)
-                .map(([key, value]) => [key, String(value)])
-                .flat();
-              
-              await this.redis.hSet(`consultation:${chat.id}`, redisData);
-              await this.redis.zAdd('consultations:waiting', {
-                score: lastCustomerMessage.createdAt,
-                value: String(chat.id)
-              });
-              await this.redis.expire(`consultation:${chat.id}`, 86400);
-            }
-          } catch (error) {
-            console.error(`Error processing chat ${chat.id}:`, error.message);
-          }
-        }));
-        
-        // 배치 간 딜레이 (Rate limit 방지)
-        if (i + batchSize < allUserChats.length) {
-          await this.delay(2000); // 2초로 증가
-        }
-      }
-      
-      const scanType = isFullScan ? 'FULL SCAN' : 'QUICK SCAN';
-      console.log(`=== ${scanType} complete: ${unansweredChats.length} unanswered (${newChatsCount} new, ${skippedCount} cached) from ${allUserChats.length} total (${this.apiCallCount} API calls) ===`);
-      
-      // 정렬: 대기시간 내림차순
-      unansweredChats.sort((a, b) => {
-        const waitTimeDiff = parseInt(b.waitTime || 0) - parseInt(a.waitTime || 0);
-        if (waitTimeDiff !== 0) return waitTimeDiff;
-        
-        const nameA = a.customerName || '익명';
-        const nameB = b.customerName || '익명';
-        return nameB.localeCompare(nameA, 'ko');
-      });
-      
-      // 대시보드 업데이트
-      this.io.to('dashboard').emit('dashboard:update', unansweredChats);
-      
     } catch (error) {
-      console.error('Sync error:', error);
-    } finally {
-      this.isProcessing = false;
+      console.error('Webhook event processing error:', error);
     }
   }
 
-  calculateWaitTime(timestamp) {
-    const now = Date.now();
-    const created = parseInt(timestamp) || 0;
-    const waitTimeMs = now - created;
-    return Math.floor(waitTimeMs / 1000 / 60);
+  // 메시지 이벤트 처리
+  async handleMessageEvent(event) {
+    const { entity, refers } = event;
+    const message = entity;
+    const userChat = refers?.userChat;
+    
+    if (!userChat) return;
+    
+    // 고객 메시지인 경우
+    if (message.personType === 'user') {
+      console.log(`💬 Customer message in chat ${userChat.id}`);
+      
+      // 상담 정보 저장/업데이트
+      await this.saveConsultation(userChat, message);
+      
+      // 실시간 알림
+      this.io.to('dashboard').emit('consultation:new', {
+        id: String(userChat.id),
+        customerName: userChat.name || '익명',
+        message: message.plainText || message.message
+      });
+    }
+    // 매니저 메시지인 경우
+    else if (message.personType === 'manager') {
+      console.log(`💼 Manager replied to chat ${userChat.id}`);
+      
+      // 답변된 상담 제거
+      await this.removeConsultation(userChat.id);
+    }
+    
+    // 대시보드 업데이트
+    await this.broadcastUpdate();
   }
 
+  // 상담 상태 변경 이벤트
+  async handleUserChatEvent(event) {
+    const { entity, action } = event;
+    const userChat = entity;
+    
+    if (action === 'closed' || userChat.state === 'closed') {
+      console.log(`🔒 Chat ${userChat.id} closed`);
+      await this.removeConsultation(userChat.id);
+      await this.broadcastUpdate();
+    }
+  }
+
+  // 담당자 변경 이벤트
+  async handleAssigneeEvent(event) {
+    const { refers } = event;
+    const userChat = refers?.userChat;
+    
+    if (!userChat) return;
+    
+    // Redis에서 상담 정보 가져오기
+    const exists = await this.redis.exists(`consultation:${userChat.id}`);
+    if (exists) {
+      const assigneeId = event.entity?.managerId || userChat.assigneeId;
+      const manager = this.managers[assigneeId];
+      
+      if (manager) {
+        await this.redis.hSet(`consultation:${userChat.id}`, {
+          counselor: manager.name,
+          team: this.teamManager.getTeamByName(manager.name)
+        });
+        
+        await this.broadcastUpdate();
+      }
+    }
+  }
+
+  // 태그 변경 이벤트
+  async handleTagsEvent(event) {
+    const { entity, refers } = event;
+    const userChat = refers?.userChat;
+    
+    if (!userChat) return;
+    
+    const exists = await this.redis.exists(`consultation:${userChat.id}`);
+    if (exists) {
+      const tags = entity || [];
+      const skillTag = tags.find(tag => tag.startsWith('스킬_'));
+      
+      if (skillTag) {
+        await this.redis.hSet(`consultation:${userChat.id}`, {
+          category: skillTag
+        });
+        
+        await this.broadcastUpdate();
+      }
+    }
+  }
+
+  // 상담 정보 저장
+  async saveConsultation(userChat, lastMessage) {
+    try {
+      // 담당자 정보
+      let counselorName = '미배정';
+      let teamName = '없음';
+      
+      if (userChat.assigneeId && this.managers[userChat.assigneeId]) {
+        const assignee = this.managers[userChat.assigneeId];
+        counselorName = assignee.name;
+        teamName = this.teamManager.getTeamByName(counselorName);
+      }
+      
+      // 분류 정보
+      let category = '';
+      if (userChat.tags && userChat.tags.length > 0) {
+        const skillTag = userChat.tags.find(tag => 
+          typeof tag === 'string' && tag.startsWith('스킬_')
+        );
+        if (skillTag) category = skillTag;
+      }
+      
+      // 고객 정보
+      const customerName = userChat.name || 
+                          userChat.user?.name || 
+                          userChat.user?.phoneNumber || 
+                          '익명';
+      
+      // 대기시간 계산
+      const waitTime = Math.floor((Date.now() - lastMessage.createdAt) / 60000);
+      
+      const consultationData = {
+        id: String(userChat.id),
+        customerName: String(customerName),
+        customerMessage: String(lastMessage.plainText || lastMessage.message || ''),
+        category: String(category),
+        team: String(teamName),
+        counselor: String(counselorName),
+        waitTime: String(waitTime),
+        createdAt: String(userChat.createdAt),
+        frontUpdatedAt: String(lastMessage.createdAt),
+        chatUrl: `https://desk.channel.io/#/channels/${this.channelId}/user_chats/${userChat.id}`
+      };
+      
+      // Redis에 저장
+      await this.redis.hSet(
+        `consultation:${userChat.id}`,
+        Object.entries(consultationData).flat()
+      );
+      
+      // Sorted Set에 추가 (대기시간 기준 정렬)
+      await this.redis.zAdd('consultations:waiting', {
+        score: lastMessage.createdAt,
+        value: String(userChat.id)
+      });
+      
+      // TTL 설정 (24시간)
+      await this.redis.expire(`consultation:${userChat.id}`, 86400);
+      
+      console.log(`💾 Saved consultation ${userChat.id}`);
+    } catch (error) {
+      console.error(`Failed to save consultation ${userChat.id}:`, error);
+    }
+  }
+
+  // 상담 제거
+  async removeConsultation(chatId) {
+    try {
+      await this.redis.del(`consultation:${chatId}`);
+      await this.redis.zRem('consultations:waiting', String(chatId));
+      console.log(`🗑️ Removed consultation ${chatId}`);
+    } catch (error) {
+      console.error(`Failed to remove consultation ${chatId}:`, error);
+    }
+  }
+
+  // 미답변 상담 목록 가져오기
   async getUnansweredConsultations() {
     try {
-      const consultationIds = await this.redis.zRange('consultations:waiting', 0, -1, { REV: true });
-      const consultations = [];
+      // Sorted Set에서 모든 대기 중인 상담 ID 가져오기
+      const chatIds = await this.redis.zRange('consultations:waiting', 0, -1);
       
-      for (const id of consultationIds) {
-        const data = await this.redis.hGetAll(`consultation:${id}`);
+      const consultations = [];
+      for (const chatId of chatIds) {
+        const data = await this.redis.hGetAll(`consultation:${chatId}`);
         if (data && Object.keys(data).length > 0) {
-          data.waitTime = String(this.calculateWaitTime(parseInt(data.frontUpdatedAt)));
+          // 대기시간 재계산
+          const waitTime = Math.floor((Date.now() - parseInt(data.frontUpdatedAt)) / 60000);
+          data.waitTime = String(waitTime);
           consultations.push(data);
         }
       }
       
-      // 정렬: 대기시간 내림차순
-      consultations.sort((a, b) => {
-        const waitTimeDiff = parseInt(b.waitTime || 0) - parseInt(a.waitTime || 0);
-        if (waitTimeDiff !== 0) return waitTimeDiff;
-        
-        const nameA = a.customerName || '익명';
-        const nameB = b.customerName || '익명';
-        return nameB.localeCompare(nameA, 'ko');
-      });
+      // 대기시간 내림차순 정렬
+      consultations.sort((a, b) => parseInt(b.waitTime) - parseInt(a.waitTime));
       
       return consultations;
     } catch (error) {
-      console.error('Error getting consultations:', error);
+      console.error('Failed to get consultations:', error);
       return [];
     }
   }
+
+  // 대시보드 업데이트 브로드캐스트
+  async broadcastUpdate() {
+    const consultations = await this.getUnansweredConsultations();
+    this.io.to('dashboard').emit('dashboard:update', consultations);
+    console.log(`📡 Broadcasted update: ${consultations.length} consultations`);
+  }
+
+  // 정리
+  async cleanup() {
+    if (this.redis) {
+      await this.redis.quit();
+    }
+  }
 }
+
+module.exports = ChannelHandler;

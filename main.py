@@ -20,13 +20,34 @@ CHANNELTALK_ID = '197228'
 CHANNELTALK_DESK_URL = f'https://desk.channel.io/#/channels/{CHANNELTALK_ID}/user_chats/'
 
 # Channel API 설정 (매니저 정보 조회용)
-CHANNEL_API_KEY = os.getenv('CHANNEL_API_KEY', '')  # API 키 설정 필요
-CHANNEL_API_SECRET = os.getenv('CHANNEL_API_SECRET', '')  # API 시크릿 설정 필요
+# Channel Desk > 설정 > 보안 및 개발자 > Open API에서 키 발급
+# https://desk.channel.io/#/channels/197228/settings/security
+CHANNEL_API_KEY = os.getenv('CHANNEL_API_KEY', '')  
+CHANNEL_API_SECRET = os.getenv('CHANNEL_API_SECRET', '')
 CHANNEL_API_BASE_URL = 'https://api.channel.io'
 
+# API 키가 없으면 경고 메시지와 함께 설정 방법 안내
+if not CHANNEL_API_KEY or not CHANNEL_API_SECRET:
+    print("=" * 80)
+    print("⚠️  Channel API 키가 설정되지 않았습니다! 담당자 정보를 가져올 수 없습니다.")
+    print("=" * 80)
+    print("\n📌 API 키 설정 방법:\n")
+    print("1. Channel Desk 접속: https://desk.channel.io")
+    print("2. 설정 > 보안 및 개발자 > Open API 메뉴 이동")
+    print("3. 'API 키 생성' 버튼 클릭")
+    print("4. 생성된 Access Key와 Access Secret 복사")
+    print("5. 환경변수 설정:")
+    print("   export CHANNEL_API_KEY='your_access_key_here'")
+    print("   export CHANNEL_API_SECRET='your_access_secret_here'")
+    print("\n또는 코드에 직접 입력:")
+    print("   CHANNEL_API_KEY = 'your_access_key_here'")
+    print("   CHANNEL_API_SECRET = 'your_access_secret_here'")
+    print("\n=" * 80)
+
 # ===== 로깅 설정 =====
+# 담당자 정보 디버깅이 필요하면 level=logging.DEBUG로 변경
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO,  # DEBUG로 변경하면 더 자세한 로그 확인 가능
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger('ChannelTalk')
@@ -69,6 +90,7 @@ class ChannelTalkMonitor:
         self._sync_task = None
         self._cleanup_task = None
         self._time_update_task = None
+        self._api_enrich_task = None
         logger.info("🚀 ChannelTalkMonitor 초기화")
         
     async def setup(self):
@@ -102,16 +124,186 @@ class ChannelTalkMonitor:
             self._sync_task = asyncio.create_task(self._periodic_sync())
             self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
             self._time_update_task = asyncio.create_task(self._periodic_time_update())
+            self._api_enrich_task = asyncio.create_task(self._periodic_api_enrich())
             
         except Exception as e:
             logger.error(f"❌ Redis 연결 실패: {e}")
             raise
+    
+    async def get_userchat_from_api(self, chat_id: str) -> dict:
+        """Channel API를 통해 UserChat 정보 조회"""
+        try:
+            if not CHANNEL_API_KEY or not CHANNEL_API_SECRET:
+                return None
+            
+            headers = {
+                'x-access-key': CHANNEL_API_KEY,
+                'x-access-secret': CHANNEL_API_SECRET,
+                'Content-Type': 'application/json'
+            }
+            
+            # UserChat 정보 조회 - 여러 API 버전 시도
+            async with aiohttp.ClientSession() as session:
+                # v5 API 먼저 시도
+                for api_version in ['v5', 'v4']:
+                    url = f'{CHANNEL_API_BASE_URL}/open/{api_version}/user-chats/{chat_id}'
+                    
+                    async with session.get(url, headers=headers) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            user_chat = data.get('userChat', {})
+                            
+                            logger.info(f"✅ API {api_version}로 UserChat 조회 성공: {chat_id}")
+                            
+                            # assigneeId 확인
+                            assignee_id = user_chat.get('assigneeId')
+                            manager_ids = user_chat.get('managerIds', [])
+                            
+                            logger.info(f"📋 UserChat 정보 - assigneeId: {assignee_id}, managerIds: {manager_ids}")
+                            
+                            return user_chat
+                        elif response.status == 404:
+                            logger.debug(f"UserChat not found in {api_version}: {chat_id}")
+                            continue
+                        else:
+                            logger.warning(f"UserChat API {api_version} 조회 실패: {chat_id} - {response.status}")
+                
+                return None
+                        
+        except Exception as e:
+            logger.error(f"❌ UserChat API 조회 오류 [{chat_id}]: {e}")
+            return None
+    
+    async def get_manager_from_api(self, manager_id: str) -> dict:
+        """Channel API를 통해 Manager 정보 조회"""
+        try:
+            # 캐시 확인
+            if manager_id in self.manager_cache:
+                return self.manager_cache[manager_id]
+            
+            if not CHANNEL_API_KEY or not CHANNEL_API_SECRET:
+                return None
+            
+            headers = {
+                'x-access-key': CHANNEL_API_KEY,
+                'x-access-secret': CHANNEL_API_SECRET,
+                'Content-Type': 'application/json'
+            }
+            
+            # 개별 Manager 정보 조회 (캐시에 없는 경우)
+            async with aiohttp.ClientSession() as session:
+                # 먼저 전체 매니저 목록 재조회 시도
+                async with session.get(
+                    f'{CHANNEL_API_BASE_URL}/open/v4/managers?limit=100',
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        managers = data.get('managers', [])
+                        
+                        # 전체 캐시 업데이트
+                        for manager in managers:
+                            mid = manager.get('id')
+                            if mid:
+                                manager_info = {
+                                    'name': manager.get('name') or manager.get('displayName'),
+                                    'email': manager.get('email'),
+                                    'username': manager.get('username')
+                                }
+                                self.manager_cache[mid] = manager_info
+                                
+                                if mid == manager_id:
+                                    logger.debug(f"✅ Manager 발견: {manager_info['name']}")
+                                    return manager_info
+                        
+                        logger.warning(f"⚠️ Manager ID {manager_id} not found in list")
+                        return None
+                    elif response.status == 401:
+                        logger.error("❌ API 인증 실패 - API 키를 확인하세요")
+                        return None
+                    else:
+                        logger.warning(f"Manager API 조회 실패: {response.status}")
+                        return None
+                        
+        except asyncio.TimeoutError:
+            logger.error(f"⏱️ Manager API 조회 시간 초과 [{manager_id}]")
+            return None
+        except Exception as e:
+            logger.error(f"❌ Manager API 조회 오류 [{manager_id}]: {e}")
+            return None
+    
+    async def enrich_chat_with_api_data(self, chat_data: dict) -> dict:
+        """API를 통해 채팅 데이터에 담당자 정보 추가"""
+        try:
+            chat_id = chat_data.get('id')
+            
+            # 이미 담당자 정보가 있으면 스킵
+            if chat_data.get('assignee') and chat_data['assignee'] != '미배정':
+                return chat_data
+            
+            if not CHANNEL_API_KEY or not CHANNEL_API_SECRET:
+                return chat_data
+            
+            # UserChat 정보 조회
+            user_chat = await self.get_userchat_from_api(chat_id)
+            if not user_chat:
+                logger.debug(f"UserChat 조회 실패: {chat_id}")
+                return chat_data
+            
+            # assigneeId 또는 managerIds 확인
+            assignee_id = user_chat.get('assigneeId')
+            manager_ids = user_chat.get('managerIds', [])
+            team_id = user_chat.get('teamId')
+            
+            logger.info(f"📋 UserChat API 응답 - assigneeId: {assignee_id}, managerIds: {manager_ids}, teamId: {team_id}")
+            
+            # assigneeId가 있으면 우선 사용
+            if assignee_id:
+                manager_info = await self.get_manager_from_api(assignee_id)
+                if manager_info and manager_info.get('name'):
+                    chat_data['assignee'] = manager_info['name']
+                    chat_data['assigneeId'] = assignee_id
+                    
+                    # 팀 정보 매핑
+                    if manager_info['name'] in MEMBER_TO_TEAM:
+                        chat_data['team'] = MEMBER_TO_TEAM[manager_info['name']]
+                    
+                    logger.info(f"✅ API로 담당자 정보 업데이트: {chat_id} -> {manager_info['name']}")
+            
+            # assigneeId가 없으면 첫 번째 manager 사용
+            elif manager_ids and len(manager_ids) > 0:
+                for manager_id in manager_ids:
+                    manager_info = await self.get_manager_from_api(manager_id)
+                    if manager_info and manager_info.get('name'):
+                        chat_data['assignee'] = manager_info['name']
+                        chat_data['assigneeId'] = manager_id
+                        
+                        # 팀 정보 매핑
+                        if manager_info['name'] in MEMBER_TO_TEAM:
+                            chat_data['team'] = MEMBER_TO_TEAM[manager_info['name']]
+                        
+                        logger.info(f"✅ API로 매니저 정보 업데이트: {chat_id} -> {manager_info['name']}")
+                        break
+            
+            # 여전히 담당자 정보가 없으면 기본값 설정
+            if not chat_data.get('assignee'):
+                chat_data['assignee'] = '미배정'
+            if not chat_data.get('team'):
+                chat_data['team'] = '미배정'
+            
+            return chat_data
+            
+        except Exception as e:
+            logger.error(f"❌ API 데이터 보강 실패 [{chat_data.get('id')}]: {e}")
+            return chat_data
     
     async def load_managers(self):
         """채널톡 API를 통해 매니저 정보 로드"""
         try:
             if not CHANNEL_API_KEY or not CHANNEL_API_SECRET:
                 logger.warning("⚠️ Channel API 키가 설정되지 않음 - 매니저 정보 캐싱 건너뜀")
+                logger.warning("   모든 상담이 '미배정'으로 표시됩니다!")
                 return
             
             # API 호출하여 매니저 목록 가져오기
@@ -122,8 +314,9 @@ class ChannelTalkMonitor:
             }
             
             async with aiohttp.ClientSession() as session:
+                # 전체 매니저 목록 조회 (최대 100명)
                 async with session.get(
-                    f'{CHANNEL_API_BASE_URL}/open/v4/managers',
+                    f'{CHANNEL_API_BASE_URL}/open/v4/managers?limit=100',
                     headers=headers
                 ) as response:
                     if response.status == 200:
@@ -134,24 +327,35 @@ class ChannelTalkMonitor:
                         for manager in managers:
                             manager_id = manager.get('id')
                             if manager_id:
+                                manager_name = manager.get('name') or manager.get('displayName')
                                 self.manager_cache[manager_id] = {
-                                    'name': manager.get('name') or manager.get('displayName'),
+                                    'name': manager_name,
                                     'email': manager.get('email'),
                                     'username': manager.get('username')
                                 }
+                                
+                                # 팀 정보도 미리 확인
+                                if manager_name in MEMBER_TO_TEAM:
+                                    logger.debug(f"매니저 {manager_name} - 팀: {MEMBER_TO_TEAM[manager_name]}")
                         
                         logger.info(f"✅ {len(self.manager_cache)}명의 매니저 정보 로드 완료")
+                        
+                        # 로드된 매니저 목록 출력 (디버깅용)
+                        logger.debug(f"로드된 매니저: {list(self.manager_cache.values())[:5]}...")
                     else:
-                        logger.warning(f"⚠️ 매니저 API 호출 실패: {response.status}")
+                        logger.error(f"❌ 매니저 API 호출 실패: {response.status}")
+                        text = await response.text()
+                        logger.error(f"응답: {text}")
                         
         except Exception as e:
             logger.error(f"❌ 매니저 정보 로드 실패: {e}")
+            logger.error(f"API Key 설정 확인 필요: CHANNEL_API_KEY={bool(CHANNEL_API_KEY)}, CHANNEL_API_SECRET={bool(CHANNEL_API_SECRET)}")
     
     async def cleanup(self):
         """종료시 정리"""
         self._running = False
         
-        for task in [self._sync_task, self._cleanup_task, self._time_update_task]:
+        for task in [self._sync_task, self._cleanup_task, self._time_update_task, self._api_enrich_task]:
             if task:
                 task.cancel()
                 try:
@@ -174,8 +378,12 @@ class ChannelTalkMonitor:
             existing_ids = await self.redis.smembers('unanswered_chats')
             valid_count = 0
             removed_count = 0
+            api_enriched_count = 0
             
             current_time = datetime.now(timezone.utc)
+            
+            # API 사용 가능 여부 확인
+            api_available = bool(CHANNEL_API_KEY and CHANNEL_API_SECRET)
             
             for chat_id in existing_ids:
                 chat_data = await self.redis.get(f"chat:{chat_id}")
@@ -200,6 +408,19 @@ class ChannelTalkMonitor:
                                 removed_count += 1
                                 logger.info(f"🧹 오래된 상담 제거: {chat_id} ({age_hours:.1f}시간)")
                             else:
+                                # API를 통해 담당자 정보 보강 (API 사용 가능시)
+                                if api_available and (not data.get('assignee') or data.get('assignee') == '미배정'):
+                                    logger.debug(f"초기 로드 - API 보강 시도: {chat_id}")
+                                    enriched_data = await self.enrich_chat_with_api_data(data)
+                                    if enriched_data.get('assignee') and enriched_data['assignee'] != '미배정':
+                                        # Redis에 업데이트된 데이터 저장
+                                        await self.redis.setex(f"chat:{chat_id}", CACHE_TTL, json.dumps(enriched_data))
+                                        data = enriched_data
+                                        api_enriched_count += 1
+                                    
+                                    # API 호출 제한 방지
+                                    await asyncio.sleep(0.2)
+                                
                                 self.chat_cache[chat_id] = data
                                 valid_count += 1
                         else:
@@ -215,13 +436,21 @@ class ChannelTalkMonitor:
                     await self.redis.srem('unanswered_chats', chat_id)
                     removed_count += 1
             
-            logger.info(f"📥 초기 로드: {valid_count}개 유효 상담, {removed_count}개 제거")
+            logger.info(f"📥 초기 로드 완료:")
+            logger.info(f"   - 유효 상담: {valid_count}개")
+            logger.info(f"   - 제거된 상담: {removed_count}개")
+            if api_available:
+                logger.info(f"   - API로 보강: {api_enriched_count}개")
+            else:
+                logger.warning(f"   - API 키 없음: 담당자 정보 보강 불가")
             
             # 통계 초기화
             await self.redis.hset('stats:session', mapping={
                 'start_time': datetime.now(timezone.utc).isoformat(),
                 'initial_count': str(valid_count),
-                'removed_old': str(removed_count)
+                'removed_old': str(removed_count),
+                'api_enriched': str(api_enriched_count),
+                'api_available': str(api_available)
             })
             
         except Exception as e:
@@ -263,6 +492,58 @@ class ChannelTalkMonitor:
                 break
             except Exception as e:
                 logger.error(f"시간 업데이트 오류: {e}")
+    
+    async def _periodic_api_enrich(self):
+        """주기적으로 API를 통해 담당자 정보 업데이트"""
+        while self._running:
+            try:
+                # 처음 시작시 바로 실행
+                if not hasattr(self, '_first_enrich_done'):
+                    self._first_enrich_done = True
+                    await asyncio.sleep(5)  # 서버 시작 후 5초 대기
+                else:
+                    await asyncio.sleep(120)  # 2분마다 실행 (5분 -> 2분으로 단축)
+                
+                if not CHANNEL_API_KEY or not CHANNEL_API_SECRET:
+                    logger.warning("⚠️ API 키 없음 - 담당자 정보 업데이트 스킵")
+                    continue
+                
+                enriched_count = 0
+                failed_count = 0
+                
+                for chat_id, chat_data in list(self.chat_cache.items()):
+                    # 담당자 정보가 없는 상담만 업데이트
+                    if not chat_data.get('assignee') or chat_data.get('assignee') == '미배정':
+                        enriched_data = await self.enrich_chat_with_api_data(chat_data)
+                        
+                        if enriched_data.get('assignee') and enriched_data['assignee'] != '미배정':
+                            # 캐시와 Redis 업데이트
+                            self.chat_cache[chat_id] = enriched_data
+                            await self.redis.setex(f"chat:{chat_id}", CACHE_TTL, json.dumps(enriched_data))
+                            enriched_count += 1
+                            logger.info(f"✅ 담당자 정보 업데이트: {chat_id} -> {enriched_data['assignee']}")
+                        else:
+                            failed_count += 1
+                        
+                        # API 호출 제한 방지 (초당 2개)
+                        await asyncio.sleep(0.5)
+                
+                if enriched_count > 0 or failed_count > 0:
+                    logger.info(f"🔄 API 업데이트 완료: 성공 {enriched_count}개, 실패 {failed_count}개")
+                    
+                    if enriched_count > 0:
+                        # WebSocket으로 업데이트 알림
+                        await self.broadcast({
+                            'type': 'data_enriched',
+                            'count': enriched_count,
+                            'timestamp': datetime.now(timezone.utc).isoformat()
+                        })
+                    
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"API 보강 작업 오류: {e}")
+                await asyncio.sleep(60)  # 오류시 1분 대기
     
     async def _cleanup_old_data(self):
         """12시간 이상 된 상담 자동 제거"""
@@ -414,6 +695,12 @@ class ChannelTalkMonitor:
             await pipe.expire(f"chat:{chat_id}:messages", CACHE_TTL)
             
             # 채팅 데이터 저장/업데이트
+            # 담당자 정보가 없으면 기본값 설정
+            if not chat_data.get('assignee'):
+                chat_data['assignee'] = '미배정'
+            if not chat_data.get('team'):
+                chat_data['team'] = '미배정'
+            
             await pipe.setex(f"chat:{chat_id}", CACHE_TTL, json.dumps(chat_data))
             
             # 인덱스 업데이트
@@ -637,8 +924,8 @@ class ChannelTalkMonitor:
             data = await request.json()
             event_type = data.get('type')
             
-            # 디버깅용 로그
-            logger.debug(f"웹훅 수신: {json.dumps(data, ensure_ascii=False, indent=2)}")
+            # 디버깅용 로그 (담당자 정보가 안 나올 때만 사용)
+            # logger.debug(f"웹훅 수신: {json.dumps(data, ensure_ascii=False, indent=2)}")
             
             # 비동기 처리로 응답 속도 향상
             if event_type == 'message':
@@ -666,20 +953,104 @@ class ChannelTalkMonitor:
             
             logger.info(f"📨 메시지 수신: chat_id={chat_id}, person_type={person_type}")
             
+            # 전체 웹훅 데이터 디버깅 (담당자 정보 찾기)
+            logger.debug(f"🔍 웹훅 전체 데이터: {json.dumps(data, ensure_ascii=False, indent=2)}")
+            
             if person_type == 'user':
                 # 고객 메시지
                 user_info = refers.get('user', {})
                 user_chat = refers.get('userChat', {})
                 
-                # 담당자 정보 추출 (개선된 버전)
-                assignee_name, assignee_id, assignee_team = self.extract_assignee_info(data)
+                # 담당자 정보 추출 - 모든 가능한 위치 확인
+                assignee_name = None
+                assignee_id = None
+                assignee_team = None
                 
-                logger.info(f"📌 담당자 정보: {assignee_name} ({assignee_team}) [ID: {assignee_id}]")
+                # 1. userChat의 직접 필드들 확인
+                if user_chat:
+                    assignee_id = user_chat.get('assigneeId')
+                    manager_ids = user_chat.get('managerIds', [])
+                    
+                    logger.debug(f"🔍 userChat.assigneeId: {assignee_id}")
+                    logger.debug(f"🔍 userChat.managerIds: {manager_ids}")
+                    
+                    # assignee 객체가 있으면
+                    if 'assignee' in user_chat and user_chat['assignee']:
+                        assignee = user_chat['assignee']
+                        assignee_name = assignee.get('name') or assignee.get('displayName')
+                        logger.debug(f"🔍 userChat.assignee 발견: {assignee}")
+                
+                # 2. entity의 assigneeId 확인
+                if not assignee_id:
+                    assignee_id = entity.get('assigneeId')
+                    if assignee_id:
+                        logger.debug(f"🔍 entity.assigneeId: {assignee_id}")
+                
+                # 3. refers의 다른 위치들 확인
+                if 'assignee' in refers and refers['assignee']:
+                    assignee = refers['assignee']
+                    if not assignee_name:
+                        assignee_name = assignee.get('name') or assignee.get('displayName')
+                    if not assignee_id:
+                        assignee_id = assignee.get('id')
+                    logger.debug(f"🔍 refers.assignee 발견: {assignee}")
+                
+                # 4. 매니저 목록에서 assigneeId로 매칭
+                if assignee_id and not assignee_name:
+                    managers = refers.get('managers', [])
+                    for manager in managers:
+                        if manager.get('id') == assignee_id:
+                            assignee_name = manager.get('name') or manager.get('displayName')
+                            logger.debug(f"🔍 매니저 목록에서 매칭: {manager}")
+                            break
+                
+                # 5. managerIds를 사용해서 첫 번째 매니저 찾기
+                if not assignee_name and user_chat and user_chat.get('managerIds'):
+                    manager_ids = user_chat['managerIds']
+                    if manager_ids and len(manager_ids) > 0:
+                        first_manager_id = manager_ids[0]
+                        # managers 목록에서 찾기
+                        managers = refers.get('managers', [])
+                        for manager in managers:
+                            if manager.get('id') == first_manager_id:
+                                assignee_name = manager.get('name') or manager.get('displayName')
+                                assignee_id = first_manager_id
+                                logger.debug(f"🔍 첫 번째 매니저로 설정: {manager}")
+                                break
+                
+                # 6. 캐시된 매니저 정보에서 조회
+                if not assignee_name and assignee_id and assignee_id in self.manager_cache:
+                    assignee_name = self.manager_cache[assignee_id].get('name')
+                    logger.debug(f"🔍 캐시에서 매니저 정보 발견: {assignee_name}")
+                
+                # 7. 팀 정보 매핑
+                if assignee_name and assignee_name in MEMBER_TO_TEAM:
+                    assignee_team = MEMBER_TO_TEAM[assignee_name]
+                
+                # API로 담당자 정보 즉시 조회 (웹훅에 정보가 없는 경우)
+                if not assignee_name and CHANNEL_API_KEY:
+                    logger.info(f"📡 API로 담당자 정보 조회 시도: {chat_id}")
+                    user_chat_api = await self.get_userchat_from_api(chat_id)
+                    if user_chat_api:
+                        assignee_id = user_chat_api.get('assigneeId')
+                        if assignee_id:
+                            manager_info = await self.get_manager_from_api(assignee_id)
+                            if manager_info:
+                                assignee_name = manager_info.get('name')
+                                if assignee_name in MEMBER_TO_TEAM:
+                                    assignee_team = MEMBER_TO_TEAM[assignee_name]
+                                logger.info(f"✅ API로 담당자 정보 획득: {assignee_name} ({assignee_team})")
+                
+                logger.info(f"📌 최종 담당자 정보: {assignee_name} ({assignee_team}) [ID: {assignee_id}]")
                 
                 # timestamp 처리 - createdAt 우선 사용
                 timestamp = entity.get('createdAt')
                 if not timestamp:
                     timestamp = datetime.now(timezone.utc).isoformat()
+                else:
+                    # 숫자 형식이면 ISO 형식으로 변환
+                    if isinstance(timestamp, (int, float)):
+                        timestamp = datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc).isoformat()
                 
                 chat_data = {
                     'id': str(chat_id),
@@ -689,13 +1060,13 @@ class ChannelTalkMonitor:
                         user_info.get('profile', {}).get('name') or 
                         '익명'
                     ),
-                    'lastMessage': entity.get('plainText', ''),
-                    'timestamp': timestamp,  # ISO 형식으로 저장
+                    'lastMessage': entity.get('plainText', '') or '(메시지 없음)',
+                    'timestamp': timestamp,
                     'channel': refers.get('channel', {}).get('name', ''),
                     'tags': user_chat.get('tags', []) if user_chat else [],
-                    'assignee': assignee_name or '미배정',
+                    'assignee': assignee_name,
                     'assigneeId': assignee_id,
-                    'team': assignee_team or '미배정'
+                    'team': assignee_team
                 }
                 
                 await self.save_chat(chat_data)
@@ -736,9 +1107,44 @@ class ChannelTalkMonitor:
             chat_id = entity.get('id')
             state = entity.get('state')
             
-            # userChat 이벤트에서 담당자 정보 업데이트
+            logger.info(f"📋 UserChat 이벤트: chat_id={chat_id}, state={state}")
+            
+            # userChat 이벤트에서 담당자 정보 추출
             if chat_id:
-                assignee_name, assignee_id, assignee_team = self.extract_assignee_info(data)
+                assignee_name = None
+                assignee_id = None
+                assignee_team = None
+                
+                # entity에서 직접 assigneeId 확인
+                assignee_id = entity.get('assigneeId')
+                if assignee_id:
+                    logger.debug(f"🔍 UserChat assigneeId: {assignee_id}")
+                
+                # managerIds 확인
+                manager_ids = entity.get('managerIds', [])
+                if manager_ids:
+                    logger.debug(f"🔍 UserChat managerIds: {manager_ids}")
+                    # 첫 번째 매니저를 담당자로 설정
+                    if not assignee_id and len(manager_ids) > 0:
+                        assignee_id = manager_ids[0]
+                
+                # refers에서 매니저 정보 가져오기
+                refers = data.get('refers', {})
+                if assignee_id:
+                    managers = refers.get('managers', [])
+                    for manager in managers:
+                        if manager.get('id') == assignee_id:
+                            assignee_name = manager.get('name') or manager.get('displayName')
+                            logger.debug(f"🔍 UserChat에서 매니저 발견: {assignee_name}")
+                            break
+                
+                # 캐시에서 조회
+                if not assignee_name and assignee_id and assignee_id in self.manager_cache:
+                    assignee_name = self.manager_cache[assignee_id].get('name')
+                
+                # 팀 매핑
+                if assignee_name and assignee_name in MEMBER_TO_TEAM:
+                    assignee_team = MEMBER_TO_TEAM[assignee_name]
                 
                 if state == 'opened':
                     # 기존 캐시에 있는 상담이면 담당자 정보 업데이트
@@ -748,12 +1154,15 @@ class ChannelTalkMonitor:
                             self.chat_cache[str(chat_id)]['assigneeId'] = assignee_id
                             self.chat_cache[str(chat_id)]['team'] = assignee_team or '미배정'
                             logger.info(f"📝 담당자 업데이트: {chat_id} -> {assignee_name} ({assignee_team})")
+                        else:
+                            logger.warning(f"⚠️ UserChat에서 담당자 정보 없음: {chat_id}")
                 
                 elif state in ['closed', 'resolved', 'snoozed']:
                     await self.remove_chat(str(chat_id))
                 
         except Exception as e:
             logger.error(f"상태 처리 오류: {e}")
+            logger.error(f"UserChat 데이터: {json.dumps(data, ensure_ascii=False, indent=2)}")
     
     async def get_chats(self, request):
         """API: 채팅 목록"""
@@ -1596,6 +2005,10 @@ DASHBOARD_HTML = """
                     }
                 } else if (data.type === 'time_update') {
                     updateWaitTimes();
+                } else if (data.type === 'data_enriched') {
+                    // API로 담당자 정보가 업데이트된 경우
+                    console.log(`✅ ${data.count}개 상담의 담당자 정보가 업데이트되었습니다`);
+                    fetchData();  // 전체 데이터 새로고침
                 }
             };
             
@@ -1723,8 +2136,25 @@ async def create_app():
         logger.info("⚡ 채널톡 실시간 모니터링 시스템 v2.0")
         logger.info(f"📌 대시보드: http://localhost:{PORT}")
         logger.info(f"🔌 WebSocket: ws://localhost:{PORT}/ws")
-        logger.info(f"🎯 웹훅: http://localhost:{PORT}/webhook")
+        logger.info(f"🎯 웹훅: http://localhost:{PORT}/webhook?token={WEBHOOK_TOKEN}")
         logger.info(f"🆔 채널톡 ID: {CHANNELTALK_ID}")
+        
+        # API 키 상태 확인
+        if CHANNEL_API_KEY and CHANNEL_API_SECRET:
+            logger.info("✅ Channel API 키 설정됨 - 담당자 정보 자동 조회 활성화")
+        else:
+            logger.warning("=" * 60)
+            logger.warning("⚠️  Channel API 키가 설정되지 않았습니다!")
+            logger.warning("    담당자 정보를 가져올 수 없어 모든 상담이 '미배정'으로 표시됩니다.")
+            logger.warning("")
+            logger.warning("📌 설정 방법:")
+            logger.warning("1. https://desk.channel.io 접속")
+            logger.warning("2. 설정 > 보안 및 개발자 > Open API")
+            logger.warning("3. API 키 생성 후 환경변수 설정:")
+            logger.warning("   export CHANNEL_API_KEY='your_key'")
+            logger.warning("   export CHANNEL_API_SECRET='your_secret'")
+            logger.warning("=" * 60)
+        
         logger.info("=" * 60)
     
     async def on_cleanup(app):
@@ -1739,6 +2169,31 @@ async def create_app():
 # ===== 메인 실행 =====
 if __name__ == '__main__':
     logger.info("🏁 프로그램 시작")
+    
+    # API 키 확인
+    if not CHANNEL_API_KEY or not CHANNEL_API_SECRET:
+        print("\n" + "=" * 80)
+        print("⚠️  경고: Channel API 키가 설정되지 않았습니다!")
+        print("=" * 80)
+        print("\n담당자 정보를 가져오려면 API 키가 필요합니다.")
+        print("설정 없이 계속하면 모든 상담이 '미배정'으로 표시됩니다.\n")
+        print("API 키 설정 방법:")
+        print("1. https://desk.channel.io 접속")
+        print("2. 설정 > 보안 및 개발자 > Open API")
+        print("3. API 키 생성 후:")
+        print("   export CHANNEL_API_KEY='your_key'")
+        print("   export CHANNEL_API_SECRET='your_secret'")
+        print("\n계속하시겠습니까? (y/n): ", end="")
+        
+        try:
+            response = input().strip().lower()
+            if response != 'y':
+                print("프로그램을 종료합니다.")
+                exit(0)
+        except:
+            pass
+        
+        print("\nAPI 키 없이 계속합니다...\n")
     
     async def main():
         app = await create_app()

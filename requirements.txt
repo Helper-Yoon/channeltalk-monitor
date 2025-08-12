@@ -1,17 +1,2 @@
-# ChannelTalk Monitor Dependencies
-# Python 3.11.13
-
-# Core
 aiohttp==3.9.1
 redis[hiredis]==5.0.1
-
-# 의존성 패키지들은 자동으로 설치됩니다:
-# - attrs>=17.3.0
-# - multidict<7.0,>=4.5
-# - yarl<2.0,>=1.0
-# - frozenlist>=1.1.1
-# - aiosignal>=1.1.2
-# - hiredis>=1.0.0
-# - typing-extensions>=4.2
-# - idna>=2.0
-# - propcache>=0.2.1

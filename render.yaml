@@ -3,23 +3,12 @@ services:
     name: channeltalk-monitor
     runtime: node
     region: oregon
-    plan: pro
-    branch: main
+    plan: free
     buildCommand: npm install
     startCommand: npm start
     healthCheckPath: /health
-    domains:
-      - channeltalk-monitor.onrender.com
     envVars:
       - key: NODE_ENV
         value: production
       - key: PORT
         value: 10000
-      - key: CHANNEL_API_KEY
-        value: 688a26176fcb19aebf8b
-      - key: CHANNEL_API_SECRET
-        sync: false
-      - key: WEBHOOK_TOKEN
-        value: 80ab2d11835f44b89010c8efa5eec4b4
-      - key: REDIS_URL
-        value: redis://red-d2ct46buibrs738rintg:6379

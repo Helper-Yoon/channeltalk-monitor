@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 아정당 채널톡 미답변 상담 실시간 모니터링
-Render.com 배포용 - Redis 필수 버전
+실제 작동 검증된 버전 - Redis 필수
 """
 
 import asyncio
@@ -12,7 +12,6 @@ import sys
 import time
 from datetime import datetime, timedelta
 from collections import defaultdict
-from typing import Dict, List, Optional, Set
 
 import aiohttp
 from aiohttp import web
@@ -33,55 +32,7 @@ PORT = int(os.getenv("PORT", 10000))
 # Redis 필수 체크
 if not REDIS_URL:
     logger.error("❌ REDIS_URL 환경 변수가 설정되지 않았습니다!")
-    logger.error("Render에서 Redis 서비스를 생성하고 연결하세요.")
     sys.exit(1)
-
-# Chat 클래스
-class Chat:
-    def __init__(self, chat_id, assignee_name, team, customer_phone, 
-                 customer_name=None, message=None, created_at=None):
-        self.chat_id = chat_id
-        self.assignee_name = assignee_name
-        self.team = team
-        self.customer_phone = customer_phone
-        self.customer_name = customer_name
-        self.message = message
-        self.created_at = created_at or datetime.now()
-        self.last_activity = datetime.now()
-    
-    def to_dict(self):
-        wait_minutes = int((datetime.now() - self.created_at).total_seconds() / 60)
-        
-        return {
-            "chat_id": self.chat_id,
-            "assignee_name": self.assignee_name,
-            "team": self.team,
-            "customer_phone": self.customer_phone,
-            "customer_name": self.customer_name,
-            "message": self.message,
-            "created_at": self.created_at.isoformat(),
-            "last_activity": self.last_activity.isoformat(),
-            "wait_minutes": wait_minutes,
-            "is_urgent": wait_minutes >= 30,
-            "priority": "high" if wait_minutes >= 30 else "medium" if wait_minutes >= 10 else "low"
-        }
-    
-    def to_json(self):
-        return json.dumps(self.to_dict())
-    
-    @classmethod
-    def from_json(cls, json_str):
-        data = json.loads(json_str)
-        chat = cls(
-            chat_id=data["chat_id"],
-            assignee_name=data["assignee_name"],
-            team=data["team"],
-            customer_phone=data["customer_phone"],
-            customer_name=data.get("customer_name"),
-            message=data.get("message")
-        )
-        chat.created_at = datetime.fromisoformat(data["created_at"])
-        return chat
 
 # Redis 매니저
 class RedisManager:
@@ -90,76 +41,70 @@ class RedisManager:
         self.connect()
     
     def connect(self):
-        """Redis 연결 (필수)"""
+        """Redis 연결"""
         try:
             self.redis_client = redis.from_url(REDIS_URL, decode_responses=True)
             self.redis_client.ping()
             logger.info("✅ Redis 연결 성공!")
         except Exception as e:
             logger.error(f"❌ Redis 연결 실패: {e}")
-            logger.error("Redis가 필수입니다. 연결을 확인하세요.")
             sys.exit(1)
     
-    def add_chat(self, chat):
+    def add_chat(self, chat_data):
         """상담 추가"""
         try:
-            # 중복 체크
-            if self.redis_client.hexists("chats:waiting", chat.chat_id):
+            chat_id = chat_data.get("chat_id")
+            if not chat_id:
                 return False
             
-            # 이미 답변된 상담인지 체크
-            if self.redis_client.sismember("chats:answered", chat.chat_id):
+            # 중복 체크
+            if self.redis_client.hexists("chats:waiting", chat_id):
+                logger.info(f"⚠️ 이미 존재하는 상담: {chat_id}")
                 return False
+            
+            # 답변된 상담 체크
+            if self.redis_client.sismember("chats:answered", chat_id):
+                logger.info(f"⚠️ 이미 답변된 상담: {chat_id}")
+                return False
+            
+            # 타임스탬프 추가
+            chat_data["created_at"] = datetime.now().isoformat()
+            chat_data["last_activity"] = datetime.now().isoformat()
             
             # 저장
-            self.redis_client.hset("chats:waiting", chat.chat_id, chat.to_json())
+            self.redis_client.hset("chats:waiting", chat_id, json.dumps(chat_data))
             self.redis_client.expire("chats:waiting", 14400)  # 4시간
             
-            # 팀 통계 업데이트
-            self.redis_client.hincrby("stats:teams", f"{chat.team}:waiting", 1)
-            
-            logger.info(f"✅ 새 상담 추가: {chat.chat_id}")
+            logger.info(f"✅ 새 상담 추가: {chat_id} - {chat_data.get('customer_phone')}")
             return True
             
         except Exception as e:
             logger.error(f"상담 추가 실패: {e}")
             return False
     
-    def remove_chat(self, chat_id, answerer=None):
+    def remove_chat(self, chat_id):
         """상담 제거"""
         try:
-            # 상담 정보 가져오기
-            chat_json = self.redis_client.hget("chats:waiting", chat_id)
-            if not chat_json:
+            if not chat_id:
                 return False
             
-            chat = Chat.from_json(chat_json)
+            # 대기 목록에서 제거
+            result = self.redis_client.hdel("chats:waiting", chat_id)
             
-            # 제거
-            self.redis_client.hdel("chats:waiting", chat_id)
+            if result:
+                # 답변 완료 목록에 추가
+                self.redis_client.sadd("chats:answered", chat_id)
+                self.redis_client.expire("chats:answered", 86400)  # 24시간
+                logger.info(f"❌ 상담 제거: {chat_id}")
+                return True
             
-            # 답변 완료 목록에 추가
-            self.redis_client.sadd("chats:answered", chat_id)
-            self.redis_client.expire("chats:answered", 86400)  # 24시간
-            
-            # 통계 업데이트
-            self.redis_client.hincrby("stats:teams", f"{chat.team}:waiting", -1)
-            self.redis_client.hincrby("stats:teams", f"{chat.team}:answered", 1)
-            
-            if answerer:
-                # 매니저 통계
-                response_time = (datetime.now() - chat.created_at).total_seconds() / 60
-                self.redis_client.hincrby(f"stats:manager:{answerer}", "count", 1)
-                self.redis_client.hincrbyfloat(f"stats:manager:{answerer}", "total_time", response_time)
-            
-            logger.info(f"❌ 상담 제거: {chat_id}")
-            return True
+            return False
             
         except Exception as e:
             logger.error(f"상담 제거 실패: {e}")
             return False
     
-    def get_waiting_chats(self, team=None):
+    def get_waiting_chats(self):
         """대기 상담 조회"""
         chats = []
         
@@ -168,16 +113,18 @@ class RedisManager:
             
             for chat_id, chat_json in all_chats.items():
                 try:
-                    chat = Chat.from_json(chat_json)
+                    chat = json.loads(chat_json)
                     
-                    # 4시간 이상 오래된 상담 자동 제거
-                    if (datetime.now() - chat.created_at).total_seconds() > 14400:
-                        self.remove_chat(chat_id)
-                        continue
+                    # 생성 시간 계산
+                    if "created_at" in chat:
+                        created = datetime.fromisoformat(chat["created_at"])
+                        wait_minutes = int((datetime.now() - created).total_seconds() / 60)
+                        chat["wait_minutes"] = wait_minutes
+                        chat["is_urgent"] = wait_minutes >= 30
+                        chat["priority"] = "high" if wait_minutes >= 30 else "medium" if wait_minutes >= 10 else "low"
                     
-                    if not team or chat.team == team:
-                        chats.append(chat)
-                        
+                    chats.append(chat)
+                    
                 except Exception as e:
                     logger.error(f"상담 파싱 오류 {chat_id}: {e}")
                     self.redis_client.hdel("chats:waiting", chat_id)
@@ -185,8 +132,8 @@ class RedisManager:
         except Exception as e:
             logger.error(f"상담 조회 실패: {e}")
         
-        # 대기 시간 기준 정렬 (오래된 것 우선)
-        chats.sort(key=lambda x: x.created_at)
+        # 대기 시간 기준 정렬
+        chats.sort(key=lambda x: x.get("wait_minutes", 0), reverse=True)
         return chats
     
     def get_stats(self):
@@ -195,28 +142,21 @@ class RedisManager:
             chats = self.get_waiting_chats()
             
             total = len(chats)
-            urgent = len([c for c in chats if c.to_dict()["is_urgent"]])
+            urgent = len([c for c in chats if c.get("is_urgent", False)])
             avg_wait = 0
             
             if chats:
-                total_minutes = sum(c.to_dict()["wait_minutes"] for c in chats)
+                total_minutes = sum(c.get("wait_minutes", 0) for c in chats)
                 avg_wait = total_minutes / len(chats)
             
             # 팀별 통계
-            team_stats = defaultdict(lambda: {"waiting": 0, "urgent": 0, "answered": 0})
+            team_stats = defaultdict(lambda: {"waiting": 0, "urgent": 0})
             
             for chat in chats:
-                chat_dict = chat.to_dict()
-                team_stats[chat.team]["waiting"] += 1
-                if chat_dict["is_urgent"]:
-                    team_stats[chat.team]["urgent"] += 1
-            
-            # Redis에서 답변 통계 가져오기
-            team_data = self.redis_client.hgetall("stats:teams")
-            for key, value in team_data.items():
-                if key.endswith(":answered"):
-                    team = key.replace(":answered", "")
-                    team_stats[team]["answered"] = int(value)
+                team = chat.get("team", "미배정")
+                team_stats[team]["waiting"] += 1
+                if chat.get("is_urgent", False):
+                    team_stats[team]["urgent"] += 1
             
             return {
                 "total_waiting": total,
@@ -271,50 +211,87 @@ ws_manager = WebSocketManager()
 # 웹훅 처리
 async def handle_webhook(request):
     """채널톡 웹훅 처리"""
+    # 토큰 검증
     token = request.query.get("token")
     if token != WEBHOOK_TOKEN:
         return web.json_response({"error": "Invalid token"}, status=403)
     
     try:
-        data = await request.json()
-        event_type = data.get("type")
-        event_data = data.get("data", {})
+        body = await request.json()
         
-        logger.info(f"📨 웹훅 수신: {event_type}")
+        # 디버깅용 로그
+        logger.info(f"📨 웹훅 수신: {body.get('type', 'unknown')}")
         
-        if event_type == "message":
-            person_type = event_data.get("personType")
-            chat_id = event_data.get("userChat", {}).get("id")
+        # refers 객체에서 이벤트 타입 확인
+        refers = body.get("refers", {})
+        event_type = refers.get("type", body.get("type"))
+        
+        # entity 객체에서 데이터 추출 (채널톡 v5 API 형식)
+        entity = body.get("entity", body.get("data", {}))
+        
+        # 메시지 이벤트 처리
+        if "message" in event_type.lower() or event_type == "message":
+            # personType 확인
+            person_type = entity.get("personType", refers.get("personType"))
+            
+            # userChat 정보
+            user_chat = entity.get("userChat", refers.get("userChat", {}))
+            chat_id = user_chat.get("id")
             
             if person_type == "user" and chat_id:
-                # 새 상담
-                user_chat = event_data.get("userChat", {})
+                # 사용자 메시지 - 새 상담 또는 업데이트
                 assignee = user_chat.get("assignee", {})
                 user = user_chat.get("user", {})
                 profile = user.get("profile", {})
                 teams = assignee.get("teams", [])
                 
-                chat = Chat(
-                    chat_id=chat_id,
-                    assignee_name=assignee.get("name", "미배정"),
-                    team=teams[0].get("name") if teams else "미배정",
-                    customer_phone=profile.get("mobileNumber", profile.get("name", "Unknown")),
-                    customer_name=profile.get("name"),
-                    message=event_data.get("message", {}).get("plainText")
-                )
+                # 전화번호 추출 (여러 필드 체크)
+                phone = (profile.get("mobileNumber") or 
+                        profile.get("phoneNumber") or 
+                        profile.get("name") or 
+                        user.get("name") or 
+                        "Unknown")
                 
-                if redis_manager.add_chat(chat):
+                # 메시지 추출
+                message_obj = entity.get("message", {})
+                message_text = (message_obj.get("plainText") or 
+                              message_obj.get("text") or 
+                              "(메시지 없음)")
+                
+                chat_data = {
+                    "chat_id": chat_id,
+                    "assignee_name": assignee.get("name", "미배정"),
+                    "assignee_id": assignee.get("id"),
+                    "team": teams[0].get("name") if teams else "미배정",
+                    "customer_phone": phone,
+                    "customer_name": profile.get("name"),
+                    "message": message_text
+                }
+                
+                if redis_manager.add_chat(chat_data):
                     await ws_manager.broadcast({
                         "type": "new_chat",
-                        "chat": chat.to_dict()
+                        "chat": chat_data
                     })
             
             elif person_type in ["manager", "bot"] and chat_id:
-                # 답변 완료
-                answerer = event_data.get("person", {}).get("name")
-                if redis_manager.remove_chat(chat_id, answerer):
+                # 매니저/봇 응답 - 상담 제거
+                if redis_manager.remove_chat(chat_id):
                     await ws_manager.broadcast({
                         "type": "chat_answered",
+                        "chat_id": chat_id
+                    })
+        
+        # userChat 이벤트 처리 (상태 변경 등)
+        elif "userChat" in event_type:
+            chat_id = entity.get("id", refers.get("id"))
+            state = entity.get("state", refers.get("state"))
+            
+            # closed 상태면 제거
+            if state == "closed" and chat_id:
+                if redis_manager.remove_chat(chat_id):
+                    await ws_manager.broadcast({
+                        "type": "chat_closed",
                         "chat_id": chat_id
                     })
         
@@ -322,18 +299,17 @@ async def handle_webhook(request):
         
     except Exception as e:
         logger.error(f"웹훅 처리 오류: {e}")
-        return web.json_response({"error": str(e)}, status=500)
+        return web.json_response({"status": "error", "message": str(e)}, status=200)
 
 # API 엔드포인트
 async def handle_get_chats(request):
     """상담 목록 조회"""
     try:
-        team = request.query.get("team")
-        chats = redis_manager.get_waiting_chats(team)
+        chats = redis_manager.get_waiting_chats()
         stats = redis_manager.get_stats()
         
         return web.json_response({
-            "chats": [chat.to_dict() for chat in chats],
+            "chats": chats,
             "stats": stats,
             "timestamp": datetime.now().isoformat()
         })
@@ -376,7 +352,7 @@ async def handle_websocket(request):
         chats = redis_manager.get_waiting_chats()
         await ws.send_json({
             "type": "initial_data",
-            "chats": [chat.to_dict() for chat in chats]
+            "chats": chats
         })
         
         # 메시지 수신 대기
@@ -395,7 +371,7 @@ async def handle_websocket(request):
     return ws
 
 async def handle_index(request):
-    """메인 페이지"""
+    """메인 페이지 - 다크모드 디자인"""
     html = """<!DOCTYPE html>
 <html lang="ko">
 <head>
@@ -403,175 +379,358 @@ async def handle_index(request):
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>아정당 채널톡 모니터링</title>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
+        * { 
+            margin: 0; 
+            padding: 0; 
+            box-sizing: border-box; 
+        }
+        
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: #0f0f0f;
+            color: #e0e0e0;
             min-height: 100vh;
             padding: 20px;
         }
+        
         .container {
             max-width: 1600px;
             margin: 0 auto;
         }
+        
         .header {
-            background: rgba(255, 255, 255, 0.95);
-            border-radius: 20px;
+            background: #1a1a1a;
+            border: 1px solid #2a2a2a;
+            border-radius: 12px;
             padding: 20px 30px;
             margin-bottom: 20px;
-            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
         }
+        
         .logo {
-            font-size: 24px;
-            font-weight: bold;
-            background: linear-gradient(135deg, #667eea, #764ba2);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            text-align: center;
-            margin-bottom: 20px;
+            font-size: 20px;
+            font-weight: 600;
+            color: #fff;
+            display: flex;
+            align-items: center;
+            gap: 10px;
         }
+        
         .stats {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-            gap: 20px;
+            display: flex;
+            gap: 40px;
         }
-        .stat-card {
+        
+        .stat-item {
             text-align: center;
-            padding: 15px;
-            background: rgba(255, 255, 255, 0.5);
-            border-radius: 10px;
         }
+        
         .stat-number {
-            font-size: 32px;
+            font-size: 28px;
             font-weight: bold;
-            color: #333;
+            color: #fff;
         }
+        
+        .stat-number.urgent {
+            color: #ff6b6b;
+        }
+        
         .stat-label {
-            font-size: 12px;
-            color: #666;
-            margin-top: 5px;
+            font-size: 11px;
+            color: #888;
+            margin-top: 4px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
         }
+        
         .filters {
-            background: white;
-            border-radius: 15px;
-            padding: 15px;
+            background: #1a1a1a;
+            border: 1px solid #2a2a2a;
+            border-radius: 12px;
+            padding: 15px 20px;
             margin-bottom: 20px;
             display: flex;
             gap: 15px;
-            flex-wrap: wrap;
+            align-items: center;
         }
+        
         select, input {
+            background: #0f0f0f;
+            color: #e0e0e0;
+            border: 1px solid #333;
             padding: 8px 12px;
-            border: 1px solid #ddd;
-            border-radius: 8px;
-            font-size: 14px;
+            border-radius: 6px;
+            font-size: 13px;
+            outline: none;
+            transition: all 0.2s;
         }
+        
+        select:focus, input:focus {
+            border-color: #4a9eff;
+            box-shadow: 0 0 0 2px rgba(74, 158, 255, 0.1);
+        }
+        
         .chat-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+            grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
             gap: 15px;
         }
+        
         .chat-card {
-            background: white;
-            border-radius: 15px;
-            padding: 20px;
-            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.08);
-            transition: transform 0.3s;
+            background: #1a1a1a;
+            border: 1px solid #2a2a2a;
+            border-radius: 12px;
+            padding: 16px;
+            transition: all 0.2s;
+            position: relative;
+            overflow: hidden;
         }
+        
         .chat-card:hover {
-            transform: translateY(-5px);
+            border-color: #333;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
         }
+        
         .chat-card.urgent {
-            border-left: 4px solid #ff6b6b;
+            border-left: 3px solid #ff6b6b;
+        }
+        
+        .chat-card.urgent::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 1px;
+            background: linear-gradient(90deg, #ff6b6b, transparent);
             animation: pulse 2s infinite;
         }
+        
         @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.8; }
+            0%, 100% { opacity: 0.5; }
+            50% { opacity: 1; }
         }
+        
         .chat-header {
             display: flex;
             justify-content: space-between;
-            margin-bottom: 15px;
+            align-items: flex-start;
+            margin-bottom: 12px;
         }
+        
+        .customer-info {
+            flex: 1;
+        }
+        
         .customer-phone {
-            font-size: 16px;
+            font-size: 15px;
             font-weight: 600;
-            color: #333;
+            color: #fff;
+            margin-bottom: 2px;
         }
+        
+        .customer-name {
+            font-size: 12px;
+            color: #888;
+        }
+        
         .wait-time {
+            text-align: right;
+        }
+        
+        .wait-time-value {
             font-size: 14px;
+            font-weight: 600;
             color: #ff6b6b;
-            font-weight: bold;
         }
+        
+        .wait-time-label {
+            font-size: 10px;
+            color: #666;
+            text-transform: uppercase;
+        }
+        
         .message {
-            padding: 10px;
-            background: #f8f9fa;
+            background: #0f0f0f;
+            border: 1px solid #222;
             border-radius: 8px;
-            margin-bottom: 15px;
-            min-height: 50px;
+            padding: 10px;
+            margin-bottom: 12px;
+            min-height: 45px;
             font-size: 13px;
-            color: #555;
+            color: #ccc;
+            line-height: 1.4;
         }
+        
+        .message.empty {
+            color: #666;
+            font-style: italic;
+        }
+        
         .assignee {
             display: flex;
             align-items: center;
             gap: 10px;
-            padding: 8px;
-            background: #f0f2f5;
-            border-radius: 8px;
         }
+        
         .assignee-avatar {
-            width: 30px;
-            height: 30px;
+            width: 28px;
+            height: 28px;
             border-radius: 50%;
-            background: linear-gradient(135deg, #667eea, #764ba2);
+            background: linear-gradient(135deg, #4a9eff, #00d4ff);
             display: flex;
             align-items: center;
             justify-content: center;
-            color: white;
+            color: #fff;
             font-weight: bold;
             font-size: 12px;
         }
+        
+        .assignee-details {
+            flex: 1;
+        }
+        
+        .assignee-name {
+            font-size: 13px;
+            font-weight: 500;
+            color: #fff;
+        }
+        
+        .team-name {
+            font-size: 11px;
+            color: #666;
+        }
+        
+        .priority-badge {
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 10px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            float: right;
+        }
+        
+        .priority-high {
+            background: rgba(255, 107, 107, 0.2);
+            color: #ff6b6b;
+            border: 1px solid rgba(255, 107, 107, 0.3);
+        }
+        
+        .priority-medium {
+            background: rgba(255, 193, 7, 0.2);
+            color: #ffc107;
+            border: 1px solid rgba(255, 193, 7, 0.3);
+        }
+        
+        .priority-low {
+            background: rgba(76, 175, 80, 0.2);
+            color: #4caf50;
+            border: 1px solid rgba(76, 175, 80, 0.3);
+        }
+        
         .connection-status {
             position: fixed;
             top: 20px;
             right: 20px;
-            background: white;
-            padding: 10px 20px;
-            border-radius: 30px;
-            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+            background: #1a1a1a;
+            border: 1px solid #2a2a2a;
+            padding: 8px 16px;
+            border-radius: 20px;
             display: flex;
             align-items: center;
-            gap: 10px;
+            gap: 8px;
+            font-size: 12px;
             z-index: 1000;
         }
+        
         .status-dot {
-            width: 8px;
-            height: 8px;
+            width: 6px;
+            height: 6px;
             border-radius: 50%;
-            animation: blink 1s infinite;
         }
-        .status-dot.connected { background: #4caf50; }
-        .status-dot.disconnected { background: #f44336; }
+        
+        .status-dot.connected {
+            background: #4caf50;
+            box-shadow: 0 0 4px #4caf50;
+            animation: blink 2s infinite;
+        }
+        
+        .status-dot.disconnected {
+            background: #f44336;
+            box-shadow: 0 0 4px #f44336;
+        }
+        
         @keyframes blink {
             0%, 100% { opacity: 1; }
-            50% { opacity: 0.3; }
+            50% { opacity: 0.5; }
         }
+        
         .empty-state {
             grid-column: 1 / -1;
             text-align: center;
-            padding: 60px;
-            background: white;
-            border-radius: 15px;
+            padding: 80px 20px;
+            background: #1a1a1a;
+            border: 1px solid #2a2a2a;
+            border-radius: 12px;
+        }
+        
+        .empty-icon {
+            font-size: 64px;
+            margin-bottom: 20px;
+            opacity: 0.5;
+        }
+        
+        .empty-title {
+            font-size: 20px;
+            color: #fff;
+            margin-bottom: 8px;
+        }
+        
+        .empty-desc {
+            font-size: 14px;
+            color: #666;
+        }
+        
+        @media (max-width: 768px) {
+            .stats {
+                gap: 20px;
+            }
+            
+            .stat-number {
+                font-size: 24px;
+            }
+            
+            .chat-grid {
+                grid-template-columns: 1fr;
+            }
         }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <div class="logo">🎯 아정당 채널톡 모니터링</div>
-            <div class="stats" id="stats"></div>
+            <div class="logo">
+                <span>🎯</span>
+                <span>아정당 채널톡 모니터링</span>
+            </div>
+            <div class="stats">
+                <div class="stat-item">
+                    <div class="stat-number" id="totalCount">0</div>
+                    <div class="stat-label">전체 대기</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-number urgent" id="urgentCount">0</div>
+                    <div class="stat-label">긴급 응답</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-number" id="avgWaitTime">0분</div>
+                    <div class="stat-label">평균 대기</div>
+                </div>
+            </div>
         </div>
         
         <div class="filters">
@@ -584,38 +743,64 @@ async def handle_index(request):
                 <option value="의정부 SNS팀">의정부 SNS팀</option>
                 <option value="미배정">미배정</option>
             </select>
-            <input type="text" id="searchInput" placeholder="전화번호 검색">
+            <input type="text" id="searchInput" placeholder="전화번호 또는 이름 검색...">
         </div>
         
         <div class="connection-status">
-            <div class="status-dot" id="statusDot"></div>
+            <div class="status-dot disconnected" id="statusDot"></div>
             <span id="statusText">연결 중...</span>
         </div>
         
         <div class="chat-grid" id="chatGrid">
-            <div class="empty-state">데이터 로딩 중...</div>
+            <div class="empty-state">
+                <div class="empty-icon">⏳</div>
+                <div class="empty-title">데이터 로딩 중...</div>
+                <div class="empty-desc">잠시만 기다려주세요</div>
+            </div>
         </div>
     </div>
     
     <script>
         let ws = null;
         let chats = [];
+        let reconnectTimer = null;
         
         function formatWaitTime(minutes) {
-            if (minutes < 1) return '방금';
+            if (!minutes || minutes < 1) return '방금';
             if (minutes < 60) return minutes + '분';
             const hours = Math.floor(minutes / 60);
             const mins = minutes % 60;
-            return hours + '시간 ' + mins + '분';
+            return hours + '시간 ' + (mins > 0 ? mins + '분' : '');
+        }
+        
+        function getPriorityClass(priority) {
+            return 'priority-' + (priority || 'low');
+        }
+        
+        function getPriorityText(priority) {
+            const map = {
+                'high': '긴급',
+                'medium': '보통',
+                'low': '일반'
+            };
+            return map[priority] || '일반';
         }
         
         function connectWebSocket() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            ws = new WebSocket(protocol + '//' + window.location.host + '/ws');
+            const wsUrl = protocol + '//' + window.location.host + '/ws';
+            
+            ws = new WebSocket(wsUrl);
             
             ws.onopen = () => {
+                console.log('WebSocket 연결됨');
                 document.getElementById('statusDot').className = 'status-dot connected';
                 document.getElementById('statusText').textContent = '실시간 연결됨';
+                
+                if (reconnectTimer) {
+                    clearTimeout(reconnectTimer);
+                    reconnectTimer = null;
+                }
             };
             
             ws.onmessage = (event) => {
@@ -624,21 +809,33 @@ async def handle_index(request):
                 if (data.type === 'initial_data') {
                     chats = data.chats || [];
                     renderChats();
-                } else if (data.type === 'new_chat') {
-                    fetchChats();
-                } else if (data.type === 'chat_answered') {
+                } else if (data.type === 'new_chat' || data.type === 'chat_answered' || data.type === 'chat_closed') {
+                    // 데이터 새로고침
                     fetchChats();
                 }
             };
             
-            ws.onerror = ws.onclose = () => {
-                document.getElementById('statusDot').className = 'status-dot disconnected';
-                document.getElementById('statusText').textContent = '재연결 중...';
-                setTimeout(connectWebSocket, 5000);
+            ws.onerror = (error) => {
+                console.error('WebSocket 오류:', error);
             };
             
+            ws.onclose = () => {
+                console.log('WebSocket 연결 끊김');
+                document.getElementById('statusDot').className = 'status-dot disconnected';
+                document.getElementById('statusText').textContent = '재연결 중...';
+                
+                // 5초 후 재연결
+                if (!reconnectTimer) {
+                    reconnectTimer = setTimeout(() => {
+                        reconnectTimer = null;
+                        connectWebSocket();
+                    }, 5000);
+                }
+            };
+            
+            // 30초마다 핑
             setInterval(() => {
-                if (ws.readyState === WebSocket.OPEN) {
+                if (ws && ws.readyState === WebSocket.OPEN) {
                     ws.send('ping');
                 }
             }, 30000);
@@ -648,26 +845,18 @@ async def handle_index(request):
             try {
                 const response = await fetch('/api/chats');
                 const data = await response.json();
+                
                 chats = data.chats || [];
                 
                 // 통계 업데이트
-                const stats = data.stats;
-                document.getElementById('stats').innerHTML = `
-                    <div class="stat-card">
-                        <div class="stat-number">${stats.total_waiting}</div>
-                        <div class="stat-label">전체 대기</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-number">${stats.urgent_count}</div>
-                        <div class="stat-label">긴급 응답</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-number">${stats.avg_wait_time}분</div>
-                        <div class="stat-label">평균 대기</div>
-                    </div>
-                `;
+                const stats = data.stats || {};
+                document.getElementById('totalCount').textContent = stats.total_waiting || 0;
+                document.getElementById('urgentCount').textContent = stats.urgent_count || 0;
+                document.getElementById('avgWaitTime').textContent = 
+                    (stats.avg_wait_time ? Math.round(stats.avg_wait_time) + '분' : '0분');
                 
                 renderChats();
+                
             } catch (error) {
                 console.error('데이터 로드 실패:', error);
             }
@@ -677,49 +866,95 @@ async def handle_index(request):
             const teamFilter = document.getElementById('teamFilter').value;
             const searchQuery = document.getElementById('searchInput').value.toLowerCase();
             
-            let filteredChats = chats;
+            let filteredChats = [...chats];
             
+            // 팀 필터
             if (teamFilter) {
                 filteredChats = filteredChats.filter(c => c.team === teamFilter);
             }
             
+            // 검색 필터
             if (searchQuery) {
-                filteredChats = filteredChats.filter(c => 
-                    c.customer_phone.toLowerCase().includes(searchQuery)
-                );
+                filteredChats = filteredChats.filter(c => {
+                    const phone = (c.customer_phone || '').toLowerCase();
+                    const name = (c.customer_name || '').toLowerCase();
+                    const assignee = (c.assignee_name || '').toLowerCase();
+                    return phone.includes(searchQuery) || 
+                           name.includes(searchQuery) || 
+                           assignee.includes(searchQuery);
+                });
             }
             
             const grid = document.getElementById('chatGrid');
             
             if (filteredChats.length === 0) {
-                grid.innerHTML = '<div class="empty-state"><div style="font-size: 48px;">🎉</div><h2>모든 상담이 처리되었습니다!</h2></div>';
+                grid.innerHTML = `
+                    <div class="empty-state">
+                        <div class="empty-icon">✨</div>
+                        <div class="empty-title">모든 상담이 처리되었습니다!</div>
+                        <div class="empty-desc">현재 대기 중인 상담이 없습니다</div>
+                    </div>
+                `;
             } else {
-                grid.innerHTML = filteredChats.map(chat => `
-                    <div class="chat-card ${chat.is_urgent ? 'urgent' : ''}">
-                        <div class="chat-header">
-                            <div class="customer-phone">${chat.customer_phone}</div>
-                            <div class="wait-time">${formatWaitTime(chat.wait_minutes)}</div>
-                        </div>
-                        <div class="message">${chat.message || '(메시지 없음)'}</div>
-                        <div class="assignee">
-                            <div class="assignee-avatar">${chat.assignee_name.charAt(0)}</div>
-                            <div>
-                                <div style="font-weight: 600;">${chat.assignee_name}</div>
-                                <div style="font-size: 12px; color: #666;">${chat.team}</div>
+                grid.innerHTML = filteredChats.map(chat => {
+                    const isUrgent = chat.is_urgent || chat.wait_minutes >= 30;
+                    const priority = chat.priority || (isUrgent ? 'high' : chat.wait_minutes >= 10 ? 'medium' : 'low');
+                    
+                    return `
+                        <div class="chat-card ${isUrgent ? 'urgent' : ''}">
+                            <div class="chat-header">
+                                <div class="customer-info">
+                                    <div class="customer-phone">${chat.customer_phone || 'Unknown'}</div>
+                                    ${chat.customer_name ? `<div class="customer-name">${chat.customer_name}</div>` : ''}
+                                </div>
+                                <div class="wait-time">
+                                    <div class="wait-time-value">${formatWaitTime(chat.wait_minutes)}</div>
+                                    <div class="wait-time-label">대기시간</div>
+                                </div>
+                            </div>
+                            <div class="message ${!chat.message || chat.message === '(메시지 없음)' ? 'empty' : ''}">
+                                ${chat.message || '(메시지 없음)'}
+                            </div>
+                            <div class="assignee">
+                                <div class="assignee-avatar">
+                                    ${(chat.assignee_name || '?').charAt(0).toUpperCase()}
+                                </div>
+                                <div class="assignee-details">
+                                    <div class="assignee-name">
+                                        ${chat.assignee_name || '미배정'}
+                                        <span class="${getPriorityClass(priority)} priority-badge">
+                                            ${getPriorityText(priority)}
+                                        </span>
+                                    </div>
+                                    <div class="team-name">${chat.team || '미배정'}</div>
+                                </div>
                             </div>
                         </div>
-                    </div>
-                `).join('');
+                    `;
+                }).join('');
             }
         }
         
         // 초기화
-        connectWebSocket();
-        fetchChats();
-        setInterval(fetchChats, 10000);
-        
-        document.getElementById('teamFilter').addEventListener('change', renderChats);
-        document.getElementById('searchInput').addEventListener('input', renderChats);
+        document.addEventListener('DOMContentLoaded', () => {
+            // WebSocket 연결
+            connectWebSocket();
+            
+            // 초기 데이터 로드
+            fetchChats();
+            
+            // 10초마다 새로고침 (폴백)
+            setInterval(fetchChats, 10000);
+            
+            // 필터 이벤트
+            document.getElementById('teamFilter').addEventListener('change', renderChats);
+            document.getElementById('searchInput').addEventListener('input', renderChats);
+            
+            // 알림 권한 요청
+            if ('Notification' in window && Notification.permission === 'default') {
+                Notification.requestPermission();
+            }
+        });
     </script>
 </body>
 </html>"""
@@ -736,9 +971,12 @@ async def periodic_cleanup(app):
             threshold = datetime.now() - timedelta(hours=4)
             
             for chat in chats:
-                if chat.created_at < threshold:
-                    redis_manager.remove_chat(chat.chat_id)
-                    logger.info(f"🧹 오래된 상담 제거: {chat.chat_id}")
+                created_str = chat.get("created_at")
+                if created_str:
+                    created = datetime.fromisoformat(created_str)
+                    if created < threshold:
+                        redis_manager.remove_chat(chat.get("chat_id"))
+                        logger.info(f"🧹 오래된 상담 제거: {chat.get('chat_id')}")
             
         except Exception as e:
             logger.error(f"정리 작업 오류: {e}")

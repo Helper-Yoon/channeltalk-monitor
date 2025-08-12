@@ -13,19 +13,14 @@ class ChannelHandler {
     // 디버깅용 로그
     console.log('Channel ID initialized:', this.channelId);
     
-    // 태그 매핑 정보 (ID -> 깔끔한 이름)
-    this.tagMappings = {
-      // 스킬 관련
+    // 채널톡 팀 ID -> 분류명 매핑
+    this.teamCategoryMappings = {
       '12119': '파트장',
       '12116': '챗봇진행중',
       '11844': '기타렌탈',
       '11800': '정수기',
       '11801': '재약정',
-      '11799': '인터넷',
-      // 추가 태그는 여기에 계속 추가
-      // '11802': 'TV',
-      // '11803': '모바일',
-      // '11804': '결합상품',
+      '11799': '인터넷'
     };
     
     // 접두사 제거 패턴
@@ -45,48 +40,39 @@ class ChannelHandler {
     // 캐시
     this.managers = {};
     this.lastManagerLoad = 0;
+    this.channelTeams = {};  // 채널톡 팀 정보 캐시
+    this.lastTeamLoad = 0;
   }
 
-  // 태그 정보를 깔끔한 분류명으로 변환
-  getCleanCategory(tags) {
-    if (!tags || tags.length === 0) return '';
+  // 팀 ID에서 깔끔한 분류명 가져오기
+  getCategoryFromTeam(teamId) {
+    if (!teamId) return '';
     
-    // 태그 배열에서 분류 찾기
-    for (const tag of tags) {
-      // 태그가 객체인 경우 (ID와 name 포함)
-      if (typeof tag === 'object' && tag !== null) {
-        // ID 매핑 우선 확인
-        if (tag.id && this.tagMappings[String(tag.id)]) {
-          return this.tagMappings[String(tag.id)];
-        }
-        
-        // name에서 접두사 제거
-        if (tag.name) {
-          let cleanName = tag.name;
-          
-          // 모든 접두사 패턴 제거
-          for (const pattern of this.prefixPatterns) {
-            cleanName = cleanName.replace(pattern, '');
-          }
-          
-          cleanName = cleanName.trim();
-          if (cleanName) return cleanName;
-        }
-      }
-      // 태그가 문자열인 경우
-      else if (typeof tag === 'string') {
-        let cleanName = tag;
-        
-        // 모든 접두사 패턴 제거
-        for (const pattern of this.prefixPatterns) {
-          cleanName = cleanName.replace(pattern, '');
-        }
-        
-        cleanName = cleanName.trim();
-        if (cleanName) return cleanName;
-      }
+    const teamIdStr = String(teamId);
+    
+    // 매핑에서 찾기
+    if (this.teamCategoryMappings[teamIdStr]) {
+      return this.teamCategoryMappings[teamIdStr];
     }
     
+    // 캐시된 팀 정보에서 찾기
+    if (this.channelTeams[teamIdStr]) {
+      let cleanName = this.channelTeams[teamIdStr].name;
+      
+      // 접두사 제거
+      for (const pattern of this.prefixPatterns) {
+        cleanName = cleanName.replace(pattern, '');
+      }
+      
+      return cleanName.trim();
+    }
+    
+    return '';
+  }
+
+  // 태그 정보를 깔끔한 분류명으로 변환 (더 이상 사용 안 함, 호환성 유지)
+  getCleanCategory(tags) {
+    // 이제는 사용하지 않지만 호환성을 위해 유지
     return '';
   }
 
@@ -118,10 +104,60 @@ class ChannelHandler {
     // 1. 매니저 정보 로드 (캐싱)
     await this.loadManagers();
     
-    // 2. 초기 미답변 상담 로드 (최소한의 API 호출)
+    // 2. 채널톡 팀 정보 로드
+    await this.loadChannelTeams();
+    
+    // 3. 초기 미답변 상담 로드 (최소한의 API 호출)
     await this.loadInitialConsultations();
     
     console.log('✅ Initialization complete');
+  }
+
+  // 채널톡 팀 정보 로드
+  async loadChannelTeams() {
+    try {
+      const now = Date.now();
+      if (this.channelTeams && Object.keys(this.channelTeams).length > 0 && 
+          now - this.lastTeamLoad < 3600000) {
+        return;
+      }
+
+      console.log('📥 Loading channel teams...');
+      
+      // 채널톡 팀 목록 가져오기
+      const data = await this.makeRequest('/teams');
+      const teams = data.teams || [];
+      
+      this.channelTeams = {};
+      teams.forEach(team => {
+        this.channelTeams[team.id] = {
+          id: team.id,
+          name: team.name
+        };
+        
+        // 매핑에 없는 팀이면 추가
+        if (!this.teamCategoryMappings[String(team.id)]) {
+          // 접두사 제거
+          let cleanName = team.name;
+          for (const pattern of this.prefixPatterns) {
+            cleanName = cleanName.replace(pattern, '');
+          }
+          this.teamCategoryMappings[String(team.id)] = cleanName.trim();
+        }
+      });
+      
+      this.lastTeamLoad = now;
+      console.log(`✅ Loaded ${teams.length} channel teams`);
+      
+      // Redis에 캐싱
+      await this.redis.hSet('cache:channelteams', 
+        Object.entries(this.channelTeams).map(([k, v]) => [k, JSON.stringify(v)]).flat()
+      );
+      await this.redis.expire('cache:channelteams', 3600);
+      
+    } catch (error) {
+      console.error('Failed to load channel teams:', error);
+    }
   }
 
   // 잘못된 데이터 정리
@@ -150,8 +186,17 @@ class ChannelHandler {
             needsUpdate = true;
           }
           
-          // 분류 정리 (모든 접두사 제거)
-          if (data.category) {
+          // 팀 ID가 있으면 분류 재생성
+          if (data.teamId) {
+            const newCategory = this.getCategoryFromTeam(data.teamId);
+            if (newCategory !== data.category) {
+              data.category = newCategory;
+              needsUpdate = true;
+              categoryFixedCount++;
+            }
+          }
+          // 기존 분류에서 접두사 제거 (호환성)
+          else if (data.category) {
             let cleanCategory = data.category;
             
             // 모든 접두사 패턴 제거
@@ -276,12 +321,13 @@ class ChannelHandler {
               return;
             }
             
-            // 상세 정보 가져오기 (태그 정보 포함)
+            // 상세 정보 가져오기 (팀 ID 포함)
             let fullChat = chat;
             try {
               const chatDetail = await this.makeRequest(`/user-chats/${chat.id}`);
               if (chatDetail.userChat) {
                 fullChat = chatDetail.userChat;
+                console.log(`Chat ${chat.id} has team ID: ${fullChat.teamId}`);
               }
             } catch (detailError) {
               console.log(`Could not get details for chat ${chat.id}, using basic info`);
@@ -355,8 +401,12 @@ class ChannelHandler {
           await this.handleAssigneeEvent(event);
           break;
           
-        case 'userChatTags':
-          await this.handleTagsEvent(event);
+        case 'userChatTeam':  // 팀 변경 이벤트
+          await this.handleTeamChangeEvent(event);
+          break;
+          
+        case 'userChatTags':  // 태그는 이제 무시
+          // await this.handleTagsEvent(event);
           break;
           
         default:
@@ -367,16 +417,28 @@ class ChannelHandler {
     }
   }
 
-  // 상담 종료 이벤트 처리
-  async handleChatCloseEvent(event) {
+  // 팀 변경 이벤트 처리
+  async handleTeamChangeEvent(event) {
     const { entity, refers } = event;
-    const userChat = entity || refers?.userChat;
+    const userChat = refers?.userChat;
     
     if (!userChat) return;
     
-    console.log(`🔒 Chat close event for ${userChat.id}`);
-    await this.removeConsultation(userChat.id);
-    await this.broadcastUpdate();
+    const exists = await this.redis.exists(`consultation:${userChat.id}`);
+    if (exists) {
+      const teamId = entity?.teamId || userChat.teamId;
+      const category = this.getCategoryFromTeam(teamId);
+      
+      if (category) {
+        await this.redis.hSet(`consultation:${userChat.id}`, {
+          category: category,
+          teamId: String(teamId)
+        });
+        
+        console.log(`🏷️ Updated team category for chat ${userChat.id}: ${category}`);
+        await this.broadcastUpdate();
+      }
+    }
   }
 
   // 메시지 이벤트 처리
@@ -501,27 +563,22 @@ class ChannelHandler {
     }
   }
 
-  // 태그 변경 이벤트
-  async handleTagsEvent(event) {
+  // 상담 종료 이벤트 처리
+  async handleChatCloseEvent(event) {
     const { entity, refers } = event;
-    const userChat = refers?.userChat;
+    const userChat = entity || refers?.userChat;
     
     if (!userChat) return;
     
-    const exists = await this.redis.exists(`consultation:${userChat.id}`);
-    if (exists) {
-      const tags = entity || [];
-      const category = this.getCleanCategory(tags);
-      
-      if (category) {
-        await this.redis.hSet(`consultation:${userChat.id}`, {
-          category: category
-        });
-        
-        console.log(`🏷️ Updated category for chat ${userChat.id}: ${category}`);
-        await this.broadcastUpdate();
-      }
-    }
+    console.log(`🔒 Chat close event for ${userChat.id}`);
+    await this.removeConsultation(userChat.id);
+    await this.broadcastUpdate();
+  }
+
+  // 태그 변경 이벤트 (더 이상 사용 안 함)
+  async handleTagsEvent(event) {
+    // 태그는 이제 분류에 사용하지 않음
+    console.log('Tag event received but ignored (using team ID for category)');
   }
 
   // 상담 정보 저장
@@ -543,8 +600,10 @@ class ChannelHandler {
         teamName = this.teamManager.getTeamByName(counselorName);
       }
       
-      // 분류 정보 - 깔끔하게 처리
-      const category = this.getCleanCategory(userChat.tags);
+      // 분류 정보 - 팀 ID에서 가져오기
+      const category = this.getCategoryFromTeam(userChat.teamId);
+      
+      console.log(`📋 Chat ${userChat.id} - Team ID: ${userChat.teamId}, Category: ${category}`);
       
       // 고객 정보
       const customerName = userChat.name || 
@@ -563,7 +622,8 @@ class ChannelHandler {
         team: String(teamName),
         counselor: String(counselorName),
         waitTime: String(waitTime),
-        state: String(userChat.state || 'opened'),  // 상태 저장
+        state: String(userChat.state || 'opened'),
+        teamId: String(userChat.teamId || ''),  // 팀 ID 저장
         createdAt: String(userChat.createdAt),
         frontUpdatedAt: String(lastMessage.createdAt),
         chatUrl: `https://desk.channel.io/#/channels/197228/user_chats/${userChat.id}`
@@ -682,6 +742,17 @@ class ChannelHandler {
               await this.removeConsultation(chatId);
               closedCount++;
               return;
+            }
+            
+            // 팀 ID가 변경되었으면 분류 업데이트
+            const existingData = await this.redis.hGetAll(`consultation:${chatId}`);
+            if (existingData && userChat.teamId && existingData.teamId !== String(userChat.teamId)) {
+              const newCategory = this.getCategoryFromTeam(userChat.teamId);
+              await this.redis.hSet(`consultation:${chatId}`, {
+                category: newCategory,
+                teamId: String(userChat.teamId)
+              });
+              console.log(`Updated category for chat ${chatId}: ${newCategory}`);
             }
             
             // 각 상담의 최신 메시지 5개 확인

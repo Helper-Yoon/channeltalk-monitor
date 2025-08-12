@@ -44,9 +44,9 @@
 
         .app-wrapper {
             width: 100%;
-            max-width: 1600px;
-            height: 90vh;
-            max-height: 900px;
+            max-width: 1800px;
+            height: 95vh;
+            max-height: 1000px;
             background: var(--bg);
             border-radius: 16px;
             overflow: hidden;
@@ -218,11 +218,11 @@
 
         .table-header {
             display: grid;
-            grid-template-columns: 45px 90px 1fr 110px 110px;
-            padding: 0.625rem 0.875rem;
+            grid-template-columns: 50px 100px 1fr 120px 130px 130px;
+            padding: 0.75rem 1rem;
             background: rgba(0, 0, 0, 0.5);
             border-bottom: 1px solid var(--border);
-            font-size: 0.6875rem;
+            font-size: 0.75rem;
             font-weight: 600;
             text-transform: uppercase;
             color: var(--text-dim);
@@ -231,14 +231,14 @@
 
         .table-row {
             display: grid;
-            grid-template-columns: 45px 90px 1fr 110px 110px;
-            padding: 0.625rem 0.875rem;
+            grid-template-columns: 50px 100px 1fr 120px 130px 130px;
+            padding: 0.75rem 1rem;
             border-bottom: 1px solid rgba(34, 34, 34, 0.5);
             align-items: center;
             transition: all 0.2s;
             cursor: pointer;
             position: relative;
-            font-size: 0.8125rem;
+            font-size: 0.875rem;
         }
 
         .table-row:hover {
@@ -339,17 +339,22 @@
             display: flex;
             align-items: center;
             gap: 0.5rem;
-            font-size: 0.8125rem;
+            font-size: 0.875rem;
+        }
+
+        .customer-info {
+            flex: 1;
+            min-width: 0;
         }
 
         .customer-message {
-            font-size: 0.6875rem;
+            font-size: 0.75rem;
             color: var(--text-muted);
             margin-top: 0.125rem;
             overflow: hidden;
             text-overflow: ellipsis;
             white-space: nowrap;
-            max-width: 100%;
+            max-width: 300px;
         }
 
         /* 팀 배지 */
@@ -358,9 +363,22 @@
             align-items: center;
             padding: 0.125rem 0.5rem;
             border-radius: 4px;
-            font-size: 0.6875rem;
+            font-size: 0.75rem;
             font-weight: 600;
             border: 1px solid;
+        }
+
+        /* 분류 배지 */
+        .category-badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 0.125rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.6875rem;
+            font-weight: 500;
+            background: rgba(139, 92, 246, 0.1);
+            border: 1px solid rgba(139, 92, 246, 0.3);
+            color: #a78bfa;
         }
 
         .team-SNS1 {
@@ -401,7 +419,7 @@
 
         /* 담당자 */
         .counselor {
-            font-size: 0.75rem;
+            font-size: 0.8125rem;
             color: var(--text-muted);
         }
 
@@ -594,6 +612,7 @@
                     <div>우선순위</div>
                     <div>대기시간</div>
                     <div>고객명 / 메시지</div>
+                    <div>분류</div>
                     <div>팀</div>
                     <div>담당자</div>
                 </div>
@@ -725,6 +744,12 @@
                 const priority = this.getPriority(waitTime);
                 const teamClass = this.getTeamClass(consultation.team);
                 
+                // 분류 추출 (스킬_XXX에서 XXX 부분)
+                let category = consultation.category || '';
+                if (category.startsWith('스킬_')) {
+                    category = category.substring(4);
+                }
+                
                 return `
                     <div class="table-row priority-${priority}" data-id="${consultation.id}" data-url="${consultation.chatUrl}">
                         <div class="priority">
@@ -735,11 +760,14 @@
                             <div class="wait-time-label">대기중</div>
                         </div>
                         <div class="customer">
-                            <div>
+                            <div class="customer-info">
                                 <div>${this.escapeHtml(consultation.customerName || '익명')}</div>
                                 ${consultation.customerMessage ? 
-                                    `<div class="customer-message">${this.escapeHtml(consultation.customerMessage)}</div>` : ''}
+                                    `<div class="customer-message" title="${this.escapeHtml(consultation.customerMessage)}">${this.escapeHtml(consultation.customerMessage)}</div>` : ''}
                             </div>
+                        </div>
+                        <div>
+                            ${category ? `<span class="category-badge">${this.escapeHtml(category)}</span>` : '-'}
                         </div>
                         <div>
                             <span class="team-badge ${teamClass}">${consultation.team || '미배정'}</span>

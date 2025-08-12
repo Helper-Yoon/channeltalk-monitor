@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: ajungdang-unanswered
+    name: channeltalk-monitor
     env: python
     plan: pro
     region: singapore

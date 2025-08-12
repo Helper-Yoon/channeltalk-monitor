@@ -2,7 +2,6 @@ services:
   - type: web
     name: channeltalk-monitor
     runtime: node
-    region: oregon
     plan: free
     buildCommand: npm install
     startCommand: npm start
@@ -12,3 +11,11 @@ services:
         value: production
       - key: PORT
         value: 10000
+      - key: CHANNEL_API_KEY
+        value: 688a26176fcb19aebf8b
+      - key: CHANNEL_API_SECRET
+        value: a0db6c38b95c8ec4d9bb46e7c653b3e2
+      - key: WEBHOOK_TOKEN
+        value: 80ab2d11835f44b89010c8efa5eec4b4
+      - key: REDIS_URL
+        value: redis://red-d2ct46buibrs738rintg:6379

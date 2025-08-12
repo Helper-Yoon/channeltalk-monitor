@@ -1,4 +1,4 @@
-// src/channelAPI.js - 완전한 최종 버전
+// src/channelAPI.js - 오류 수정된 완전한 최종 버전
 import fetch from 'node-fetch';
 
 export class ChannelTalkService {
@@ -10,7 +10,7 @@ export class ChannelTalkService {
     this.baseURL = 'https://api.channel.io/open/v5';
     this.managers = {}; // 매니저 정보 캐시
     
-    // 팀별 담당자 매핑
+    // 팀별 담당자 매핑 - 로그에서 확인된 실제 이름들 포함
     this.teamMembers = {
       'SNS 1팀': ['이종민', '정주연', '이혜영', '김국현', '정다혜', '조시현', '김시윤'],
       'SNS 2팀': ['윤도우리', '신혜서', '김상아', '박은진', '오민환', '서정국'],
@@ -56,7 +56,6 @@ export class ChannelTalkService {
       if (data.managers) {
         data.managers.forEach(manager => {
           this.managers[manager.id] = manager;
-          // 매니저의 모든 이름 필드 로그
           console.log(`Manager loaded: ${manager.name || manager.displayName || manager.email} (ID: ${manager.id})`);
         });
       }
@@ -79,8 +78,8 @@ export class ChannelTalkService {
     // 정확한 이름 매칭
     for (const [team, members] of Object.entries(this.teamMembers)) {
       // 완전 일치 확인
-      if (members.includes(cleanName)) {
-        console.log(`Exact match: ${cleanName} -> ${team}`);
+      if (members.includes(cleanName) || members.includes(fullName)) {
+        console.log(`Exact match: ${fullName} -> ${team}`);
         return team;
       }
       // 부분 일치 확인
@@ -111,8 +110,8 @@ export class ChannelTalkService {
       // 매니저 정보 먼저 로드
       await this.loadManagers();
       
-      // 열린 상담 조회
-      const data = await this.makeRequest('/user-chats?state=opened&limit=200&sortOrder=-createdAt');
+      // 열린 상담 조회 - sortOrder를 desc로 수정
+      const data = await this.makeRequest('/user-chats?state=opened&limit=200&sortOrder=desc');
       const userChats = data.userChats || [];
       
       console.log(`Found ${userChats.length} open chats`);
@@ -131,8 +130,8 @@ export class ChannelTalkService {
           console.log('- Assignee:', JSON.stringify(fullChat.assignee));
           console.log('- AssigneeId:', fullChat.assigneeId);
           
-          // 마지막 메시지 확인
-          const messagesData = await this.makeRequest(`/user-chats/${chat.id}/messages?sortOrder=-createdAt&limit=20`);
+          // 마지막 메시지 확인 - sortOrder를 desc로 수정
+          const messagesData = await this.makeRequest(`/user-chats/${chat.id}/messages?sortOrder=desc&limit=20`);
           const messages = messagesData.messages || [];
           
           // 마지막 고객 메시지 찾기
@@ -214,11 +213,15 @@ export class ChannelTalkService {
       
       console.log(`=== Sync complete: ${unansweredChats.length} unanswered chats ===`);
       
-      // 시간 내림차순, 같으면 고객명 내림차순 정렬
+      // 시간 내림차순, 같으면 고객명 내림차순 정렬 - null 체크 추가
       unansweredChats.sort((a, b) => {
         const waitTimeDiff = parseInt(b.waitTime) - parseInt(a.waitTime);
         if (waitTimeDiff !== 0) return waitTimeDiff;
-        return b.customerName.localeCompare(a.customerName, 'ko');
+        
+        // customerName이 없을 경우 처리
+        const nameA = a.customerName || '익명';
+        const nameB = b.customerName || '익명';
+        return nameB.localeCompare(nameA, 'ko');
       });
       
       // 대시보드 업데이트
@@ -249,11 +252,15 @@ export class ChannelTalkService {
         }
       }
       
-      // 시간 내림차순, 같으면 고객명 내림차순 정렬
+      // 시간 내림차순, 같으면 고객명 내림차순 정렬 - null 체크 추가
       consultations.sort((a, b) => {
         const waitTimeDiff = parseInt(b.waitTime) - parseInt(a.waitTime);
         if (waitTimeDiff !== 0) return waitTimeDiff;
-        return b.customerName.localeCompare(a.customerName, 'ko');
+        
+        // customerName이 없을 경우 처리
+        const nameA = a.customerName || '익명';
+        const nameB = b.customerName || '익명';
+        return nameB.localeCompare(nameA, 'ko');
       });
       
       return consultations;

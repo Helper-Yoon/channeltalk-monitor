@@ -33,12 +33,20 @@ SYNC_INTERVAL = 60  # 데이터 동기화 간격
 MAX_RECONNECT_ATTEMPTS = 5
 RECONNECT_DELAY = 5
 
-# 팀 설정 (필요에 따라 수정)
+# 팀 설정
 TEAMS = {
-    'CS': ['김철수', '이영희', '박민수'],
-    'Sales': ['최지우', '정하늘', '강바다'],
-    'Tech': ['손코딩', '조디버그', '윤서버'],
+    'SNS 1팀': ['이종민', '정주연', '이혜영', '김국현', '정다혜', '조시현', '김시윤'],
+    'SNS 2팀': ['윤도우리', '신혜서', '김상아', '박은진', '오민환', '서정국'],
+    'SNS 3팀': ['김진후', '김시진', '권재현', '김지원', '최호익', '김진협', '박해영'],
+    'SNS 4팀': ['이민주', '전지윤', '전미란', '김채영', '김영진', '공현준'],
+    '의정부 SNS팀': ['차정환', '최수능', '구본영', '서민국', '오민경', '김범주', '동수진', '성일훈']
 }
+
+# 팀원별 팀 매핑 (빠른 조회용)
+MEMBER_TO_TEAM = {}
+for team, members in TEAMS.items():
+    for member in members:
+        MEMBER_TO_TEAM[member] = team
 
 class ChannelTalkMonitor:
     """고성능 Redis 기반 채널톡 모니터링 시스템"""
@@ -273,6 +281,12 @@ class ChannelTalkMonitor:
             await pipe.expire(f"chat:{chat_id}:messages", CACHE_TTL)
             
             # 채팅 데이터 저장/업데이트
+            # team 정보도 포함
+            if 'team' not in chat_data and chat_data.get('assignee'):
+                assignee_name = chat_data['assignee']
+                if assignee_name in MEMBER_TO_TEAM:
+                    chat_data['team'] = MEMBER_TO_TEAM[assignee_name]
+            
             await pipe.setex(f"chat:{chat_id}", CACHE_TTL, json.dumps(chat_data))
             
             # 인덱스 업데이트
@@ -323,13 +337,19 @@ class ChannelTalkMonitor:
                 await pipe.hincrby('stats:total', 'answered', 1)
                 await pipe.hincrby('stats:today', f"answered:{datetime.now().date()}", 1)
                 
-                # 답변자 랭킹 업데이트 (Bot 제외, assignee가 아닌 경우만)
+                # 답변자 랭킹 업데이트 조건:
+                # 1. Bot이 아님
+                # 2. manager_name이 존재함
+                # 3. assignee와 manager_name이 다름 (담당자가 아닌 사람이 답변)
                 if manager_name and manager_name.lower() != 'bot':
-                    if not assignee or manager_name != assignee:
+                    # assignee가 없거나, manager가 assignee와 다른 경우
+                    if not assignee or (assignee and manager_name != assignee):
                         today = datetime.now().strftime('%Y-%m-%d')
                         await pipe.hincrby('ranking:daily', f"{today}:{manager_name}", 1)
                         await pipe.hincrby('ranking:total', manager_name, 1)
-                        logger.info(f"📊 랭킹 업데이트: {manager_name} (assignee: {assignee})")
+                        logger.info(f"📊 랭킹 업데이트: {manager_name} (담당자: {assignee or '없음'}) - 카운트!")
+                    else:
+                        logger.info(f"📊 랭킹 스킵: {manager_name}은 담당자입니다.")
             
             results = await pipe.execute()
             
@@ -344,7 +364,7 @@ class ChannelTalkMonitor:
                 if cleanup:
                     logger.info(f"🧹 오래된 상담 정리: {chat_id}")
                 else:
-                    logger.info(f"✅ 제거: {chat_id} {f'(답변자: {manager_name})' if manager_name else ''}")
+                    logger.info(f"✅ 제거: {chat_id} (답변자: {manager_name}, 담당자: {assignee})")
                 
                 # WebSocket 브로드캐스트
                 await self.broadcast({
@@ -412,6 +432,12 @@ class ChannelTalkMonitor:
                     
                     chat['waitMinutes'] = max(0, int(wait_seconds / 60))
                     chat['waitSeconds'] = max(0, int(wait_seconds))
+                    
+                    # 팀 정보 보완
+                    if not chat.get('team') and chat.get('assignee'):
+                        if chat['assignee'] in MEMBER_TO_TEAM:
+                            chat['team'] = MEMBER_TO_TEAM[chat['assignee']]
+                    
                     valid_chats.append(chat)
                 except:
                     chat['waitMinutes'] = 0
@@ -500,14 +526,25 @@ class ChannelTalkMonitor:
             if not chat_id:
                 return
             
+            logger.info(f"📨 메시지 수신: chat_id={chat_id}, person_type={person_type}")
+            
             if person_type == 'user':
                 # 고객 메시지
                 user_info = refers.get('user', {})
                 user_chat = refers.get('userChat', {})
                 
-                # assignee 정보 추출
-                assignee_info = user_chat.get('assignee', {})
-                assignee_name = assignee_info.get('name') if assignee_info else None
+                # assignee 정보 추출 (여러 위치에서 시도)
+                assignee_info = user_chat.get('assignee') or entity.get('assignee', {})
+                assignee_name = None
+                assignee_team = None
+                
+                if assignee_info:
+                    assignee_name = assignee_info.get('name') or assignee_info.get('displayName')
+                    # 팀 매핑
+                    if assignee_name and assignee_name in MEMBER_TO_TEAM:
+                        assignee_team = MEMBER_TO_TEAM[assignee_name]
+                
+                logger.info(f"📌 담당자 정보: {assignee_name} ({assignee_team})")
                 
                 chat_data = {
                     'id': str(chat_id),
@@ -521,7 +558,8 @@ class ChannelTalkMonitor:
                     'timestamp': entity.get('createdAt', datetime.now(timezone.utc).isoformat()),
                     'channel': refers.get('channel', {}).get('name', ''),
                     'tags': refers.get('userChat', {}).get('tags', []),
-                    'assignee': assignee_name
+                    'assignee': assignee_name,
+                    'team': assignee_team
                 }
                 
                 await self.save_chat(chat_data)
@@ -529,17 +567,27 @@ class ChannelTalkMonitor:
             elif person_type in ['manager', 'bot']:
                 # 답변시 제거
                 manager_info = refers.get('manager', {})
-                manager_name = manager_info.get('name', 'Bot' if person_type == 'bot' else 'Unknown')
+                manager_name = manager_info.get('name') or manager_info.get('displayName')
+                
+                if not manager_name:
+                    manager_name = 'Bot' if person_type == 'bot' else 'Unknown'
                 
                 # assignee 정보 가져오기
                 user_chat = refers.get('userChat', {})
-                assignee_info = user_chat.get('assignee', {})
-                assignee_name = assignee_info.get('name') if assignee_info else None
+                assignee_info = user_chat.get('assignee') or entity.get('assignee', {})
+                assignee_name = None
                 
+                if assignee_info:
+                    assignee_name = assignee_info.get('name') or assignee_info.get('displayName')
+                
+                logger.info(f"💬 답변 처리: manager={manager_name}, assignee={assignee_name}")
+                
+                # 담당자가 아닌 경우만 랭킹 업데이트
                 await self.remove_chat(str(chat_id), manager_name, assignee_name)
                 
         except Exception as e:
             logger.error(f"메시지 처리 오류: {e}")
+            logger.error(f"데이터: {json.dumps(data, ensure_ascii=False, indent=2)}")
     
     async def process_user_chat(self, data: dict):
         """상담 상태 처리"""
@@ -548,7 +596,25 @@ class ChannelTalkMonitor:
             chat_id = entity.get('id')
             state = entity.get('state')
             
-            if chat_id and state in ['closed', 'resolved', 'snoozed']:
+            # userChat 이벤트에서도 assignee 정보 업데이트 가능
+            if chat_id and state == 'opened':
+                # 새 상담 또는 재오픈된 상담
+                assignee_info = entity.get('assignee', {})
+                assignee_name = None
+                assignee_team = None
+                
+                if assignee_info:
+                    assignee_name = assignee_info.get('name') or assignee_info.get('displayName')
+                    if assignee_name and assignee_name in MEMBER_TO_TEAM:
+                        assignee_team = MEMBER_TO_TEAM[assignee_name]
+                
+                # 기존 캐시에 있는 상담이면 담당자 정보 업데이트
+                if str(chat_id) in self.chat_cache:
+                    self.chat_cache[str(chat_id)]['assignee'] = assignee_name
+                    self.chat_cache[str(chat_id)]['team'] = assignee_team
+                    logger.info(f"📝 담당자 업데이트: {chat_id} -> {assignee_name} ({assignee_team})")
+            
+            elif chat_id and state in ['closed', 'resolved', 'snoozed']:
                 await self.remove_chat(str(chat_id))
                 
         except Exception as e:
@@ -560,10 +626,12 @@ class ChannelTalkMonitor:
         rankings = await self.get_rankings()
         
         # 팀별 필터링 (쿼리 파라미터)
-        team = request.query.get('team')
-        if team and team in TEAMS:
-            team_members = TEAMS[team]
-            chats = [c for c in chats if c.get('assignee') in team_members]
+        team_filter = request.query.get('team')
+        if team_filter and team_filter != 'all':
+            # 해당 팀 구성원들의 담당 상담만 필터링
+            if team_filter in TEAMS:
+                team_members = TEAMS[team_filter]
+                chats = [c for c in chats if c.get('assignee') in team_members]
         
         # 통계 수집
         stats = {
@@ -1177,7 +1245,8 @@ DASHBOARD_HTML = """
                                 <th style="width: 120px;">고객명</th>
                                 <th>메시지</th>
                                 <th style="width: 100px;">대기시간</th>
-                                <th style="width: 100px;">담당자</th>
+                                <th style="width: 120px;">담당자</th>
+                                <th style="width: 100px;">팀</th>
                             </tr>
                         </thead>
                         <tbody id="chatTableBody">
@@ -1249,7 +1318,7 @@ DASHBOARD_HTML = """
             if (filteredChats.length === 0) {
                 tbody.innerHTML = `
                     <tr>
-                        <td colspan="5" class="empty-state">
+                        <td colspan="6" class="empty-state">
                             <div class="empty-icon">✨</div>
                             <div class="empty-message">현재 대기 중인 상담이 없습니다</div>
                         </td>
@@ -1265,6 +1334,7 @@ DASHBOARD_HTML = """
                             <td class="message-cell">${chat.lastMessage || '(메시지 없음)'}</td>
                             <td class="time-cell ${priority}">${formatWaitTime(chat.waitMinutes)}</td>
                             <td class="assignee-cell">${chat.assignee || '-'}</td>
+                            <td class="assignee-cell">${chat.team || '-'}</td>
                         </tr>
                     `;
                 }).join('');

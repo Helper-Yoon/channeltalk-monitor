@@ -1,9 +1,0 @@
-fastapi
-uvicorn[standard]
-redis
-pydantic
-python-multipart
-websockets
-httpx
-aiofiles
-python-dotenv

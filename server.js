@@ -33,6 +33,27 @@ app.get('/health', (req, res) => {
   });
 });
 
+// 특정 상담 강제 확인 (디버깅용)
+app.get('/check/:chatId', async (req, res) => {
+  const { chatId } = req.params;
+  console.log(`Manual check requested for chat: ${chatId}`);
+  
+  try {
+    await channelHandler.checkSpecificChat(chatId);
+    const consultations = await channelHandler.getUnansweredConsultations();
+    const found = consultations.find(c => c.id === chatId);
+    
+    res.json({
+      chatId,
+      found: !!found,
+      consultation: found || null,
+      totalUnanswered: consultations.length
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Webhook endpoint - 모든 채널톡 이벤트를 수신
 app.post('/webhook', async (req, res) => {
   try {

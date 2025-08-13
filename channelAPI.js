@@ -23,6 +23,16 @@ class ChannelHandler {
       '11799': '인터넷'
     };
     
+    // 분류별 아이콘 매핑
+    this.categoryIcons = {
+      '인터넷': '🖥️',
+      '정수기': '💧',
+      '파트장': '🚩',
+      '기타렌탈': '💔',
+      '재약정': '🔄',
+      '챗봇진행중': '🤖'
+    };
+    
     // 접두사 제거 패턴
     this.prefixPatterns = [
       /^스킬_/,
@@ -110,7 +120,62 @@ class ChannelHandler {
     // 3. 초기 미답변 상담 로드 (최소한의 API 호출)
     await this.loadInitialConsultations();
     
+    // 4. 특정 상담 강제 확인 (디버깅용)
+    await this.checkSpecificChat('689be02edc4199295594');
+    
     console.log('✅ Initialization complete');
+  }
+
+  // 특정 상담 강제 확인 (디버깅용)
+  async checkSpecificChat(chatId) {
+    try {
+      console.log(`🔍 Checking specific chat: ${chatId}`);
+      
+      // 상담 정보 가져오기
+      const chatData = await this.makeRequest(`/user-chats/${chatId}`);
+      const userChat = chatData.userChat;
+      
+      if (!userChat) {
+        console.log(`❌ Chat ${chatId} not found`);
+        return;
+      }
+      
+      console.log(`📋 Chat ${chatId} info:`, {
+        state: userChat.state,
+        teamId: userChat.teamId,
+        assigneeId: userChat.assigneeId,
+        name: userChat.name
+      });
+      
+      // 메시지 확인
+      const messagesData = await this.makeRequest(
+        `/user-chats/${chatId}/messages?limit=10&sortOrder=desc`
+      );
+      const messages = messagesData.messages || [];
+      
+      console.log(`📨 Last 10 messages for chat ${chatId}:`);
+      messages.forEach((m, i) => {
+        console.log(`  ${i}: [${m.personType}] ${m.plainText || m.message || '(empty)'} - ${new Date(m.createdAt).toLocaleTimeString()}`);
+      });
+      
+      // 실제 메시지만 필터링
+      const realMessages = messages.filter(m => 
+        m.personType === 'user' || m.personType === 'manager'
+      );
+      
+      if (realMessages.length > 0) {
+        const lastRealMessage = realMessages[0];
+        console.log(`🎯 Last real message: [${lastRealMessage.personType}] ${lastRealMessage.plainText || lastRealMessage.message}`);
+        
+        if (lastRealMessage.personType === 'user' && userChat.state === 'opened') {
+          console.log(`⚠️ This chat should be in unanswered list!`);
+          // 강제로 미답변 목록에 추가
+          await this.saveConsultation(userChat, lastRealMessage);
+        }
+      }
+    } catch (error) {
+      console.error(`Error checking specific chat ${chatId}:`, error);
+    }
   }
 
   // 채널톡 팀 정보 로드
@@ -299,9 +364,19 @@ class ChannelHandler {
     try {
       console.log('📥 Loading initial consultations...');
       
-      // 진행중(opened) 상태만 가져오기
-      const data = await this.makeRequest('/user-chats?state=opened&limit=500&sortOrder=desc');
+      // 진행중(opened) 상태만 가져오기 - 1000개로 증가
+      const data = await this.makeRequest('/user-chats?state=opened&limit=1000&sortOrder=desc');
       const userChats = data.userChats || [];
+      
+      console.log(`📊 Total opened chats found: ${userChats.length}`);
+      
+      // 특정 상담 포함 여부 확인
+      const targetChat = userChats.find(c => c.id === '689be02edc4199295594');
+      if (targetChat) {
+        console.log('🔴 우산 601 상담이 opened 목록에 있음');
+      } else {
+        console.log('❌ 우산 601 상담이 opened 목록에 없음');
+      }
       
       let unansweredCount = 0;
       let answeredCount = 0;
@@ -327,7 +402,16 @@ class ChannelHandler {
               const chatDetail = await this.makeRequest(`/user-chats/${chat.id}`);
               if (chatDetail.userChat) {
                 fullChat = chatDetail.userChat;
-                console.log(`Chat ${chat.id} has team ID: ${fullChat.teamId}`);
+                
+                // 특정 상담 디버깅
+                if (chat.id === '689be02edc4199295594') {
+                  console.log('🔴 우산 601 상담 상세 정보:', {
+                    state: fullChat.state,
+                    teamId: fullChat.teamId,
+                    assigneeId: fullChat.assigneeId,
+                    name: fullChat.name
+                  });
+                }
               }
             } catch (detailError) {
               console.log(`Could not get details for chat ${chat.id}, using basic info`);
@@ -338,6 +422,14 @@ class ChannelHandler {
               `/user-chats/${chat.id}/messages?limit=5&sortOrder=desc`
             );
             const messages = messagesData.messages || [];
+            
+            // 특정 상담 디버깅
+            if (chat.id === '689be02edc4199295594') {
+              console.log('🔴 우산 601 상담 메시지:');
+              messages.forEach((m, i) => {
+                console.log(`  ${i}: [${m.personType}] ${m.plainText || m.message || '(empty)'}`);
+              });
+            }
             
             if (messages.length > 0) {
               // 봇/시스템 메시지 제외하고 마지막 실제 메시지 찾기
@@ -350,6 +442,10 @@ class ChannelHandler {
                 if (lastRealMessage.personType === 'user') {
                   await this.saveConsultation(fullChat, lastRealMessage);
                   unansweredCount++;
+                  
+                  if (chat.id === '689be02edc4199295594') {
+                    console.log('🔴 우산 601 상담을 미답변으로 저장함');
+                  }
                 } 
                 // 마지막 실제 메시지가 매니저면 답변완료
                 else if (lastRealMessage.personType === 'manager') {
@@ -726,6 +822,12 @@ class ChannelHandler {
       let cleanedCount = 0;
       let updatedCount = 0;
       let closedCount = 0;
+      
+      // 특정 상담 포함 여부 확인
+      if (!chatIds.includes('689be02edc4199295594')) {
+        console.log('❌ 우산 601 상담이 대기 목록에 없음 - 추가 확인 시작');
+        await this.checkSpecificChat('689be02edc4199295594');
+      }
       
       // 배치 처리 (5개씩)
       for (let i = 0; i < chatIds.length; i += 5) {
